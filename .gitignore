@@ -1,0 +1,11 @@
+.gradle/
+**/build/
+.idea/
+*.iml
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.p12
+logs/

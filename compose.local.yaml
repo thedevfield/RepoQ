@@ -1,0 +1,27 @@
+name: devfield-phase1
+
+services:
+  postgres:
+    image: postgres:17.6-alpine
+    container_name: devfield-dev-postgres
+    restart: "no"
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-15432}:5432"
+    environment:
+      POSTGRES_DB: devfield_dev
+      POSTGRES_USER: devfield_admin
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?set in .env.local}
+      AUTH_DB_PASSWORD: ${AUTH_DB_PASSWORD:?set in .env.local}
+      PROJECT_DB_PASSWORD: ${PROJECT_DB_PASSWORD:?set in .env.local}
+      INTERVIEW_DB_PASSWORD: ${INTERVIEW_DB_PASSWORD:?set in .env.local}
+    volumes:
+      - devfield_pgdata:/var/lib/postgresql/data
+      - ./dev/postgres/init-db.sh:/docker-entrypoint-initdb.d/10-init-db.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U devfield_admin -d devfield_dev"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  devfield_pgdata:

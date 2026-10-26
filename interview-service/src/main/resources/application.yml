@@ -1,0 +1,24 @@
+server:
+  address: 127.0.0.1
+  port: ${INTERVIEW_PORT:18082}
+
+spring:
+  application:
+    name: repoq-interview
+  datasource:
+    url: ${INTERVIEW_DB_URL:jdbc:postgresql://127.0.0.1:15432/devfield_dev?currentSchema=interview}
+    username: ${INTERVIEW_DB_USER:devfield_interview}
+    password: ${INTERVIEW_DB_PASSWORD}
+  flyway:
+    enabled: true
+    default-schema: interview
+    schemas: interview
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never

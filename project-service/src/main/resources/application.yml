@@ -1,0 +1,24 @@
+server:
+  address: 127.0.0.1
+  port: ${PROJECT_PORT:18081}
+
+spring:
+  application:
+    name: repoq-project
+  datasource:
+    url: ${PROJECT_DB_URL:jdbc:postgresql://127.0.0.1:15432/devfield_dev?currentSchema=project}
+    username: ${PROJECT_DB_USER:devfield_project}
+    password: ${PROJECT_DB_PASSWORD}
+  flyway:
+    enabled: true
+    default-schema: project
+    schemas: project
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never
