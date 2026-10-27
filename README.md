@@ -20,3 +20,14 @@ Health: http://localhost:18081/actuator/health and http://localhost:18082/actuat
 Stop the applications with Ctrl+C. Stop only this Compose project with docker compose --env-file .env.local -f compose.local.yaml down. Do not use the volume deletion option unless the local development data is intentionally being discarded.
 
 The application accounts have no rights in other service schemas. Flyway migrations belong to the service whose schema they change. This Phase has no domain migrations or tables.
+
+## Isolated local Mailpit for DevField Auth
+
+Run only `compose.mailpit.local.yaml` for test mail. It has its own Compose project and no persistent volume:
+
+```powershell
+docker compose -f compose.mailpit.local.yaml up -d
+docker compose -f compose.mailpit.local.yaml down
+```
+
+SMTP is `127.0.0.1:11025` and the inbox is `http://127.0.0.1:18025`. Set `AUTH_SMTP_HOST=127.0.0.1` and `AUTH_SMTP_PORT=11025` in the ignored Auth local environment. These commands do not manage the PostgreSQL Compose project or other projects' containers.

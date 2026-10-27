@@ -1,0 +1,9 @@
+name: devfield-mailpit-local
+
+services:
+  mailpit:
+    image: axllent/mailpit:v1.32.0
+    restart: "no"
+    ports:
+      - "127.0.0.1:11025:1025"
+      - "127.0.0.1:18025:8025"
