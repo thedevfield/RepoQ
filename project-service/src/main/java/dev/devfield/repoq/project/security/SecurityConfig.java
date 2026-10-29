@@ -31,6 +31,9 @@ public class SecurityConfig {
                         .requestMatchers("/actuator/health", "/actuator/health/**").permitAll()
                         .requestMatchers("/api/projects", "/api/projects/*",
                                 "/api/projects/*/repositories", "/api/projects/*/repositories/*").authenticated()
+                        .requestMatchers("/api/github/connections/start", "/api/github/connections/callback/complete",
+                                "/api/github/connections/setup/complete", "/api/github/connections",
+                                "/api/github/repositories").authenticated()
                         .anyRequest().denyAll())
                 .oauth2ResourceServer(oauth -> oauth.jwt(jwt -> {}))
                 .build();

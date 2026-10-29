@@ -24,6 +24,18 @@ devfield:
       service-key: ${PROJECT_AUTH_SERVICE_KEY:}
     github:
       token: ${PROJECT_GITHUB_TOKEN:}
+      app-id: ${PROJECT_GITHUB_APP_ID:}
+      client-id: ${PROJECT_GITHUB_APP_CLIENT_ID:}
+      client-secret: ${PROJECT_GITHUB_APP_CLIENT_SECRET:}
+      private-key-path: ${PROJECT_GITHUB_APP_PRIVATE_KEY_PATH:}
+      callback-url: ${PROJECT_GITHUB_APP_CALLBACK_URL:}
+      setup-url: ${PROJECT_GITHUB_APP_SETUP_URL:}
+      install-url: ${PROJECT_GITHUB_APP_INSTALL_URL:}
+      user-token-refresh-skew-seconds: ${PROJECT_GITHUB_USER_TOKEN_REFRESH_SKEW_SECONDS:120}
+      attempt-ttl-seconds: ${PROJECT_GITHUB_ATTEMPT_TTL_SECONDS:600}
+      token-key-version: ${PROJECT_GITHUB_TOKEN_KEY_VERSION:1}
+      token-key: ${PROJECT_GITHUB_TOKEN_KEY:}
+      api-timeout-seconds: ${PROJECT_GITHUB_API_TIMEOUT_SECONDS:8}
 
 management:
   endpoints:
