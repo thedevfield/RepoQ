@@ -1,6 +1,10 @@
 # RepoQ
 
-Gradle multi-project for independent Project and Interview Spring Boot services. Phase 1 exposes health only; Project, Interview, GitHub analysis and AI APIs are not implemented.
+Gradle multi-project for independent Project and Interview Spring Boot services. Project Service A stage supports multiple public GitHub repositories per project with owner-scoped P-01/P-02/P-03/P-07/P-08. Private GitHub App access and consent are the next development unit. Initial analysis remains queued; no worker, Snapshot, Interview domain, or AI API is implemented.
+
+Project API startup requires `PROJECT_AUTH_ISSUER` and `PROJECT_AUTH_AUDIENCE` matching DevField-Auth, `PROJECT_AUTH_JWKS_URI`, `PROJECT_AUTH_SESSION_CHECK_URI`, and the raw Project-only `PROJECT_AUTH_SERVICE_KEY`. Copy the names from `.env.example` into the ignored `.env.local`; do not commit secrets. `PROJECT_GITHUB_TOKEN` is optional for public repository metadata but is recommended when unauthenticated GitHub API rate limits are insufficient. All Project API calls require a Bearer access token. Project verifies the JWT locally, then calls Auth's session check with its service credential on each protected request. Auth unavailability blocks those requests.
+
+`POST /api/projects` accepts either the existing `{ "repositoryUrl": "https://github.com/owner/repo" }` or `{ "name": "Project", "repositories": [{ "repositoryUrl": "https://github.com/owner/one" }, { "repositoryUrl": "https://github.com/owner/two" }] }`. It returns HTTP 201 with `id`, `analysisStatus: QUEUED`, and repository details. `GET /api/projects` returns only the caller's project summaries; `GET /api/projects/{id}` includes per-repository and overall queued status with `canInterview: false` and `latestReadySnapshot: null`. `POST /api/projects/{id}/repositories` adds public repositories and `DELETE /api/projects/{id}/repositories/{memberId}` removes one, retaining at least one member. Private IDs, Private URLs, and consent payloads are rejected until GitHub App support exists. All writes use the Project write fences and database uniqueness; V2 backfills existing public registrations and V3 retires the legacy project-level uniqueness constraint without changing V1. A stage does not process jobs or collect repository files.
 
 ## Local PostgreSQL
 
@@ -19,7 +23,7 @@ Health: http://localhost:18081/actuator/health and http://localhost:18082/actuat
 
 Stop the applications with Ctrl+C. Stop only this Compose project with docker compose --env-file .env.local -f compose.local.yaml down. Do not use the volume deletion option unless the local development data is intentionally being discarded.
 
-The application accounts have no rights in other service schemas. Flyway migrations belong to the service whose schema they change. This Phase has no domain migrations or tables.
+The application accounts have no rights in other service schemas. Flyway migrations belong to the service whose schema they change. Project Service applies V1 through V3 at startup. Do not run an older A-stage Project binary after multiple repositories have been written; it does not maintain the new membership table.
 
 ## Isolated local Mailpit for DevField Auth
 

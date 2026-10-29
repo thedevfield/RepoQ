@@ -14,6 +14,17 @@ spring:
     default-schema: project
     schemas: project
 
+devfield:
+  project:
+    auth:
+      issuer: ${PROJECT_AUTH_ISSUER:}
+      audience: ${PROJECT_AUTH_AUDIENCE:}
+      jwks-uri: ${PROJECT_AUTH_JWKS_URI:}
+      session-check-uri: ${PROJECT_AUTH_SESSION_CHECK_URI:}
+      service-key: ${PROJECT_AUTH_SERVICE_KEY:}
+    github:
+      token: ${PROJECT_GITHUB_TOKEN:}
+
 management:
   endpoints:
     web:
