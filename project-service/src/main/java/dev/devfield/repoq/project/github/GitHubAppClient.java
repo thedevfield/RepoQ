@@ -13,6 +13,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
@@ -28,12 +29,19 @@ public class GitHubAppClient {
     private final String clientId;
     private final String clientSecret;
     private final Duration timeout;
+    private final URI tokenUri;
 
+    @Autowired
     public GitHubAppClient(@Value("${devfield.project.github.client-id:}") String clientId,
                            @Value("${devfield.project.github.client-secret:}") String clientSecret,
                            @Value("${devfield.project.github.api-timeout-seconds:8}") long timeoutSeconds) {
+        this(clientId, clientSecret, timeoutSeconds, URI.create("https://github.com/login/oauth/access_token"));
+    }
+
+    GitHubAppClient(String clientId, String clientSecret, long timeoutSeconds, URI tokenUri) {
         this.clientId = clientId;
         this.clientSecret = clientSecret;
+        this.tokenUri = tokenUri;
         if (timeoutSeconds < 1 || timeoutSeconds > 60) throw new IllegalArgumentException("Invalid GitHub timeout");
         this.timeout = Duration.ofSeconds(timeoutSeconds);
     }
@@ -49,16 +57,18 @@ public class GitHubAppClient {
     private Tokens tokens(String payload) {
         if (clientId.isBlank() || clientSecret.isBlank())
             throw new ApiProblem(HttpStatus.SERVICE_UNAVAILABLE, "github_configuration_unavailable");
-        JsonNode n = request("POST", URI.create("https://github.com/login/oauth/access_token"), null,
+        JsonNode n = request("POST", tokenUri, null,
                 "client_id=" + encode(clientId) + "&client_secret=" + encode(clientSecret) + "&" + payload);
-        String access = n.path("access_token").asText("");
-        String refresh = n.path("refresh_token").asText("");
-        long expires = n.path("expires_in").asLong(0);
-        long refreshExpires = n.path("refresh_token_expires_in").asLong(0);
-        if (access.isBlank() || refresh.isBlank() || expires < 1 || refreshExpires < 1)
+        JsonNode accessNode = n.path("access_token"), refreshNode = n.path("refresh_token");
+        JsonNode expiryNode = n.path("expires_in"), refreshExpiryNode = n.path("refresh_token_expires_in");
+        if (!accessNode.isTextual() || accessNode.asText().isBlank() ||
+                !refreshNode.isTextual() || refreshNode.asText().isBlank() ||
+                !expiryNode.isIntegralNumber() || !expiryNode.canConvertToLong() || expiryNode.asLong() < 1 ||
+                !refreshExpiryNode.isIntegralNumber() || !refreshExpiryNode.canConvertToLong() || refreshExpiryNode.asLong() < 1 ||
+                !"bearer".equalsIgnoreCase(n.path("token_type").asText()))
             throw new ApiProblem(HttpStatus.UNAUTHORIZED, "github_reauthorization_required");
         Instant now = Instant.now();
-        return new Tokens(access, refresh, now.plusSeconds(expires), now.plusSeconds(refreshExpires));
+        return new Tokens(accessNode.asText(), refreshNode.asText(), now.plusSeconds(expiryNode.asLong()), now.plusSeconds(refreshExpiryNode.asLong()));
     }
 
     public long userId(String token) {
@@ -103,7 +113,7 @@ public class GitHubAppClient {
     private JsonNode request(String method, URI uri, String token, String body) {
         try {
             HttpRequest.Builder b = HttpRequest.newBuilder(uri).timeout(timeout)
-                    .header("Accept", "application/vnd.github+json")
+                    .header("Accept", accept(uri))
                     .header("User-Agent", "DevField-RepoQ");
             if (token != null) b.header("Authorization", "Bearer " + token);
             if (body == null) b.GET();
@@ -125,6 +135,8 @@ public class GitHubAppClient {
             throw new ApiProblem(HttpStatus.SERVICE_UNAVAILABLE, "github_unavailable");
         }
     }
+
+    String accept(URI uri) { return uri.equals(tokenUri) ? "application/json" : "application/vnd.github+json"; }
 
     private static String encode(String value) { return URLEncoder.encode(value, StandardCharsets.UTF_8); }
 }
