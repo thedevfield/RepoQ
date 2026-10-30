@@ -9,6 +9,8 @@ import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.UUID;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -18,6 +20,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 @Service
 public class GitHubConnections {
+    private static final Logger log = LoggerFactory.getLogger(GitHubConnections.class);
     public record Start(String nextAction, String url, String proof, Instant expiresAt) {}
     public record Status(String userAuthorization, String installation) {}
     public record Listing(String status, java.util.List<GitHubAppClient.Repository> repositories, int page, boolean hasNext) {}
@@ -81,10 +84,16 @@ public class GitHubConnections {
     public Status callback(UUID user, UUID session, String code, String proof) {
         configured();
         if (code == null || code.isBlank() || code.length() > 512) throw invalid();
-        Attempt attempt = consume(user, session, proof, "AUTHORIZE_USER");
+        Attempt attempt;
+        try { attempt = consume(user, session, proof, "AUTHORIZE_USER"); }
+        catch (ApiProblem e) { log.warn("GitHub App callback attempt validation failed: {}", e.code()); throw e; }
         String verifier = cipher.decrypt(attempt.verifier(), attempt.keyVersion(), "attempt:" + attempt.id());
-        GitHubAppClient.Tokens tokens = github.exchange(code, verifier, callback);
-        long githubId = github.userId(tokens.access());
+        GitHubAppClient.Tokens tokens;
+        try { tokens = github.exchange(code, verifier, callback); }
+        catch (ApiProblem e) { log.warn("GitHub App callback token exchange failed: {}", e.code()); throw e; }
+        long githubId;
+        try { githubId = github.userId(tokens.access()); }
+        catch (ApiProblem e) { log.warn("GitHub App callback user verification failed: {}", e.code()); throw e; }
         try {
             tx.executeWithoutResult(s -> {
                 db.update("INSERT INTO project.github_connection (id,devfield_user_id) VALUES (?,?) ON CONFLICT (devfield_user_id) DO NOTHING",
