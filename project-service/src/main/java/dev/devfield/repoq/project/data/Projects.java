@@ -27,6 +27,8 @@ public class Projects {
     public record Registration(UUID id, String analysisStatus, List<Member> repositories) {}
     public record Addition(UUID projectId, long membershipVersion, String analysisStatus,
                            List<Member> repositories) {}
+    public record Revocation(UUID revocationId, String status) {}
+    public record Disconnection(UUID connectionId, String status) {}
     public record Consent(String purpose, String decision, String policyVersion) {}
     public record Repository(GitHubRepositoryClient.Repository identity, UUID connectionId, List<Consent> consents) {}
 
@@ -36,7 +38,9 @@ public class Projects {
 
     public Projects(JdbcTemplate db, GitHubConnections connections) { this.db = db; this.connections = connections; }
 
+    @Transactional
     public Registration replayRegistration(UUID owner, String key, String hash) {
+        lockUser(owner);
         var prior = db.query("SELECT p.create_request_hash,j.response_json::text,p.state,uf.state " +
                         "FROM project.registered_project p " +
                         "JOIN project.analysis_job j ON j.project_id=p.id AND j.trigger_kind='INITIAL' " +
@@ -50,11 +54,13 @@ public class Projects {
         if (!"ACTIVE".equals(prior.getFirst()[2])) throw conflict("project_unavailable");
         if (!hash.equals(prior.getFirst()[0])) throw conflict("idempotency_key_conflict");
         Registration replay = fromJson(prior.getFirst()[1], Registration.class);
-        checkPrivateAccess(owner, replay.repositories());
-        return replay;
+        return new Registration(replay.id(), replay.repositories().stream().anyMatch(m -> "PRIVATE".equals(m.visibility()))
+                ? latestStatus(replay.id()) : replay.analysisStatus(), redact(owner, replay.repositories()));
     }
 
+    @Transactional
     public Addition replayAddition(UUID owner, UUID projectId, String key, String hash) {
+        lockUser(owner);
         var prior = db.query("SELECT j.request_hash,j.response_json::text,p.state,uf.state,pf.state " +
                         "FROM project.analysis_job j " +
                         "JOIN project.registered_project p ON p.id=j.project_id " +
@@ -70,8 +76,10 @@ public class Projects {
             throw conflict("project_unavailable");
         if (!hash.equals(prior.getFirst()[0])) throw conflict("idempotency_key_conflict");
         Addition replay = fromJson(prior.getFirst()[1], Addition.class);
-        checkPrivateAccess(owner, replay.repositories());
-        return replay;
+        return new Addition(replay.projectId(), replay.membershipVersion(),
+                replay.repositories().stream().anyMatch(m -> "PRIVATE".equals(m.visibility()))
+                        ? latestStatus(replay.projectId()) : replay.analysisStatus(),
+                redact(owner, replay.repositories()));
     }
 
     @Transactional
@@ -135,7 +143,7 @@ public class Projects {
                 "WHERE project_id=? AND removed_at IS NULL", Integer.class, projectId);
         if (existing + repositories.size() > 20)
             throw new ApiProblem(HttpStatus.BAD_REQUEST, "invalid_repositories");
-        checkPrivateAccess(owner, privateMembers(owner, projectId));
+        boolean blocked = privateMembers(owner, projectId).stream().anyMatch(m -> !accessible(owner, m));
         if (hasRunningJob(projectId)) throw conflict("analysis_in_progress");
         // A-stage QUEUED jobs have no worker. Replace one atomically so adding to a new project works.
         cancelQueuedJob(projectId);
@@ -148,8 +156,10 @@ public class Projects {
         db.update("UPDATE project.registered_project SET membership_version=?,updated_at=now() WHERE id=?",
                 nextVersion, projectId);
         var members = membersForQueued(projectId);
-        Addition response = new Addition(projectId, nextVersion, "QUEUED", members);
+        Addition response = new Addition(projectId, nextVersion, blocked ? "CANCELLED" : "QUEUED",
+                redact(owner, members));
         insertJob(projectId, nextVersion, "MEMBERSHIP_CHANGED", members, "ADD", requestKey, requestHash, response);
+        if (blocked) cancelActiveJobs(projectId);
         return response;
     }
 
@@ -162,24 +172,25 @@ public class Projects {
                 (rs, row) -> new Object[]{rs.getBoolean(1), rs.getString(2)}, memberId, projectId, owner);
         if (rows.isEmpty()) throw new ApiProblem(HttpStatus.NOT_FOUND, "repository_not_found");
         if ((Boolean) rows.getFirst()[0]) return;
-        if ("PRIVATE".equals(rows.getFirst()[1])) throw conflict("private_removal_not_supported");
-        checkPrivateAccess(owner, privateMembers(owner, projectId));
+        boolean removingPrivate = "PRIVATE".equals(rows.getFirst()[1]);
         int count = db.queryForObject("SELECT count(*) FROM project.project_repository " +
                 "WHERE project_id=? AND removed_at IS NULL", Integer.class, projectId);
         if (count <= 1) throw conflict("last_repository_required");
         // A-stage has no worker cancellation handshake; refuse removal while one is running.
-        if (hasRunningJob(projectId)) throw conflict("analysis_in_progress");
-        cancelQueuedJob(projectId);
+        if (hasRunningJob(projectId) && !removingPrivate) throw conflict("analysis_in_progress");
+        if (removingPrivate) cancelActiveJobs(projectId); else cancelQueuedJob(projectId);
         db.update("UPDATE project.project_repository SET removed_at=now() WHERE id=?", memberId);
         long nextVersion = version + 1;
         db.update("UPDATE project.registered_project SET membership_version=?,updated_at=now() WHERE id=?",
                 nextVersion, projectId);
-        insertJob(projectId, nextVersion, "MEMBERSHIP_CHANGED", membersForQueued(projectId),
-                null, null, null, null);
+        if (privateMembers(owner, projectId).stream().allMatch(m -> accessible(owner, m)))
+            insertJob(projectId, nextVersion, "MEMBERSHIP_CHANGED", membersForQueued(projectId),
+                    null, null, null, null);
     }
 
+    @Transactional
     public List<Item> list(UUID owner) {
-        checkPrivateAccess(owner, privateMembers(owner, null));
+        lockUser(owner);
         return db.query("SELECT p.id,p.display_name,j.state," +
                         "(SELECT count(*) FROM project.project_repository r WHERE r.project_id=p.id AND r.removed_at IS NULL)," +
                         "(SELECT count(*) FROM project.project_repository r WHERE r.project_id=p.id " +
@@ -188,11 +199,17 @@ public class Projects {
                         "JOIN LATERAL (SELECT state FROM project.analysis_job WHERE project_id=p.id " +
                         "ORDER BY created_at DESC,id DESC LIMIT 1) j ON true " +
                         "WHERE p.owner_user_id=? ORDER BY p.created_at DESC,p.id DESC",
-                (rs, row) -> new Item(rs.getObject(1, UUID.class), rs.getString(2), safeStatus(rs.getString(3)),
-                        rs.getInt(4), rs.getInt(5), false), owner);
+                (rs, row) -> {
+                    UUID id = rs.getObject(1, UUID.class);
+                    boolean blocked = privateMembers(owner, id).stream().anyMatch(m -> !accessible(owner, m));
+                    return new Item(id, blocked ? "Private access unavailable" : rs.getString(2), safeStatus(rs.getString(3)),
+                            rs.getInt(4), rs.getInt(5), false);
+                }, owner);
     }
 
+    @Transactional
     public Detail detail(UUID owner, UUID id) {
+        lockUser(owner);
         var rows = db.query("SELECT p.id,p.display_name,p.state,p.membership_version,j.id,j.state " +
                         "FROM project.registered_project p " +
                         "JOIN LATERAL (SELECT id,state FROM project.analysis_job WHERE project_id=p.id " +
@@ -201,7 +218,6 @@ public class Projects {
                 (rs, row) -> new Object[]{rs.getObject(1, UUID.class), rs.getString(2), rs.getString(3),
                         rs.getLong(4), rs.getObject(5, UUID.class), rs.getString(6)}, owner, id);
         if (rows.isEmpty()) throw new ApiProblem(HttpStatus.NOT_FOUND, "project_not_found");
-        checkPrivateAccess(owner, privateMembers(owner, id));
         Object[] row = rows.getFirst();
         UUID jobId = (UUID) row[4];
         var members = db.query("SELECT r.id,r.github_repository_id,r.repository_full_name,r.visibility,r.access_state," +
@@ -216,8 +232,11 @@ public class Projects {
                 (rs, index) -> new Member(rs.getObject(1, UUID.class), rs.getString(2), rs.getString(3),
                         rs.getString(4), rs.getString(5), safeStatus(rs.getString(6)), rs.getString(7)),
                 jobId, row[5], jobId, id);
-        return new Detail((UUID) row[0], (String) row[1], (String) row[2], safeStatus((String) row[5]),
-                false, null, (Long) row[3], members, false);
+        List<Member> safe = redact(owner, members);
+        boolean blocked = safe.stream().anyMatch(m -> "PRIVATE".equals(m.visibility()) &&
+                "BLOCKED".equals(m.accessStatus()));
+        return new Detail((UUID) row[0], blocked ? "Private access unavailable" : (String) row[1], (String) row[2],
+                safeStatus((String) row[5]), false, null, (Long) row[3], safe, false);
     }
 
     public void requireOwned(UUID owner, UUID id) {
@@ -225,6 +244,147 @@ public class Projects {
                 "WHERE id=? AND owner_user_id=?", (rs, row) -> rs.getString(1), id, owner);
         if (states.isEmpty()) throw new ApiProblem(HttpStatus.NOT_FOUND, "project_not_found");
         if (!"ACTIVE".equals(states.getFirst())) throw conflict("project_unavailable");
+    }
+
+    @Transactional
+    public Revocation changeConsents(UUID owner, String repositoryId, List<Consent> decisions) {
+        if (repositoryId == null || !repositoryId.matches("[1-9][0-9]{0,18}") || decisions == null ||
+                decisions.size() != 2 || decisions.stream().map(Consent::purpose).distinct().count() != 2 ||
+                decisions.stream().anyMatch(c -> !List.of("PRIVATE_COLLECTION", "EXTERNAL_AI").contains(c.purpose()) ||
+                        !List.of("GRANTED", "DENIED", "REVOKED").contains(c.decision())))
+            throw new ApiProblem(HttpStatus.BAD_REQUEST, "invalid_request");
+        lockUser(owner);
+        var projects = projectIds(owner, "r.github_repository_id=? AND r.visibility='PRIVATE'", repositoryId);
+        projects.forEach(id -> lockProject(owner, id));
+        UUID revocationId = null;
+        for (Consent decision : decisions) {
+            var prior = db.query("SELECT decision,revocation_id,cleanup_state FROM project.repository_consent " +
+                            "WHERE owner_user_id=? AND github_repository_id=? AND purpose=? " +
+                            "ORDER BY event_order DESC LIMIT 1",
+                    (rs, n) -> new Object[]{rs.getString(1), rs.getObject(2, UUID.class), rs.getString(3)},
+                    owner, repositoryId, decision.purpose());
+            Object[] latest = prior.isEmpty() ? null : prior.getFirst();
+            String old = latest == null ? null : (String) latest[0];
+            if ("GRANTED".equals(decision.decision())) {
+                if (latest != null && "REVOKED".equals(old) && !"NO_DERIVED_DATA".equals(latest[2]))
+                    throw conflict("revocation_in_progress");
+                connections.requirePrivateRepository(owner, repositoryId);
+            } else if ("REVOKED".equals(decision.decision())) {
+                if (latest == null || !"GRANTED".equals(old) && !"REVOKED".equals(old))
+                    throw new ApiProblem(HttpStatus.FORBIDDEN, "consent_not_owned");
+                if ("REVOKED".equals(old)) {
+                    revocationId = (UUID) latest[1];
+                    continue;
+                }
+                if (revocationId == null) revocationId = UUID.randomUUID();
+            } else if ("GRANTED".equals(old) || "REVOKED".equals(old)) {
+                throw conflict("revocation_required");
+            }
+            if (decision.decision().equals(old)) continue;
+            db.update("INSERT INTO project.repository_consent" +
+                            "(id,owner_user_id,github_repository_id,purpose,decision,policy_version,revocation_id,cleanup_state) " +
+                            "VALUES (?,?,?,?,?,?,?,?)", UUID.randomUUID(), owner, repositoryId, decision.purpose(),
+                    decision.decision(), decision.policyVersion(),
+                    "REVOKED".equals(decision.decision()) ? revocationId : null,
+                    "REVOKED".equals(decision.decision()) ? "NO_DERIVED_DATA" : null);
+            if ("PRIVATE_COLLECTION".equals(decision.purpose())) {
+                if ("REVOKED".equals(decision.decision())) blockRepository(owner, repositoryId);
+                if ("GRANTED".equals(decision.decision())) {
+                    boolean wasBlocked = Boolean.TRUE.equals(db.queryForObject(
+                            "SELECT EXISTS(SELECT 1 FROM project.project_repository WHERE owner_user_id=? " +
+                            "AND github_repository_id=? AND access_state='BLOCKED' AND removed_at IS NULL)",
+                            Boolean.class, owner, repositoryId));
+                    db.update("UPDATE project.project_repository SET access_state='ACTIVE' " +
+                            "WHERE owner_user_id=? AND github_repository_id=? AND removed_at IS NULL " +
+                            "AND visibility='PRIVATE'", owner, repositoryId);
+                    if (wasBlocked) for (UUID projectId : projects) {
+                        long version = db.queryForObject("SELECT membership_version FROM project.registered_project " +
+                                "WHERE id=?", Long.class, projectId) + 1;
+                        db.update("UPDATE project.registered_project SET membership_version=?,updated_at=now() WHERE id=?",
+                                version, projectId);
+                        if (privateMembers(owner, projectId).stream().allMatch(m -> accessible(owner, m))) {
+                            cancelQueuedJob(projectId);
+                            insertJob(projectId, version, "MEMBERSHIP_CHANGED", membersForQueued(projectId),
+                                    null, null, null, null);
+                        }
+                    }
+                }
+            }
+        }
+        return new Revocation(revocationId, revocationId == null ? "UPDATED" : "BLOCKED");
+    }
+
+    @Transactional
+    public Disconnection disconnect(UUID owner, UUID connectionId) {
+        lockUser(owner);
+        var projects = projectIds(owner, "r.github_connection_id=?", connectionId);
+        projects.forEach(id -> lockProject(owner, id));
+        var state = db.query("SELECT user_state FROM project.github_connection " +
+                "WHERE id=? AND devfield_user_id=? FOR UPDATE", (rs, n) -> rs.getString(1), connectionId, owner);
+        if (state.isEmpty()) throw new ApiProblem(HttpStatus.NOT_FOUND, "connection_not_found");
+        if (!"DISCONNECTED".equals(state.getFirst())) {
+            blockConnection(owner, connectionId);
+            db.update("UPDATE project.github_connection SET generation=generation+1,user_state='DISCONNECTED'," +
+                    "installation_state='NOT_INSTALLED',installation_id=NULL,access_token_ciphertext=NULL," +
+                    "refresh_token_ciphertext=NULL,token_expires_at=NULL,refresh_expires_at=NULL," +
+                    "token_key_version=NULL,updated_at=now() WHERE id=?", connectionId);
+        }
+        return new Disconnection(connectionId, "BLOCKED");
+    }
+
+    @Transactional
+    public void blockInstallation(long installationId, List<String> repositoryIds) {
+        var owners = db.query("SELECT devfield_user_id FROM project.github_connection " +
+                "WHERE installation_id=? ORDER BY devfield_user_id", (rs, n) -> rs.getObject(1, UUID.class), installationId);
+        for (UUID owner : owners) {
+            lockUser(owner);
+            var connections = db.query("SELECT id FROM project.github_connection WHERE devfield_user_id=? " +
+                    "AND installation_id=?", (rs, n) -> rs.getObject(1, UUID.class), owner, installationId);
+            if (connections.isEmpty()) continue;
+            UUID connectionId = connections.getFirst();
+            var projects = projectIds(owner, "r.github_connection_id=?", connectionId);
+            projects.forEach(id -> lockProject(owner, id));
+            if (repositoryIds == null) {
+                blockConnection(owner, connectionId);
+                db.update("UPDATE project.github_connection SET installation_state='NOT_INSTALLED'," +
+                        "installation_id=NULL,updated_at=now() WHERE id=?", connectionId);
+            } else for (String repositoryId : repositoryIds) blockRepository(owner, repositoryId);
+        }
+    }
+
+    @Transactional
+    public void blockGitHubUser(long githubUserId) {
+        var owners = db.query("SELECT devfield_user_id,id FROM project.github_connection WHERE github_user_id=?",
+                (rs, n) -> new UUID[]{rs.getObject(1, UUID.class), rs.getObject(2, UUID.class)}, githubUserId);
+        for (UUID[] pair : owners) disconnect(pair[0], pair[1]);
+    }
+
+    private List<UUID> projectIds(UUID owner, String predicate, Object value) {
+        return db.query("SELECT DISTINCT r.project_id FROM project.project_repository r " +
+                        "WHERE r.owner_user_id=? AND r.removed_at IS NULL AND " + predicate + " ORDER BY r.project_id",
+                (rs, n) -> rs.getObject(1, UUID.class), owner, value);
+    }
+
+    private void blockConnection(UUID owner, UUID connectionId) {
+        var ids = projectIds(owner, "r.github_connection_id=?", connectionId);
+        db.update("UPDATE project.project_repository SET access_state='BLOCKED' WHERE owner_user_id=? " +
+                "AND github_connection_id=? AND visibility='PRIVATE' AND removed_at IS NULL", owner, connectionId);
+        for (UUID id : ids) {
+            cancelActiveJobs(id);
+            db.update("UPDATE project.registered_project SET membership_version=membership_version+1," +
+                    "updated_at=now() WHERE id=?", id);
+        }
+    }
+
+    private void blockRepository(UUID owner, String repositoryId) {
+        var ids = projectIds(owner, "r.github_repository_id=? AND r.visibility='PRIVATE'", repositoryId);
+        db.update("UPDATE project.project_repository SET access_state='BLOCKED' WHERE owner_user_id=? " +
+                "AND github_repository_id=? AND visibility='PRIVATE' AND removed_at IS NULL", owner, repositoryId);
+        for (UUID id : ids) {
+            cancelActiveJobs(id);
+            db.update("UPDATE project.registered_project SET membership_version=membership_version+1," +
+                    "updated_at=now() WHERE id=?", id);
+        }
     }
 
     private void lockUser(UUID owner) {
@@ -258,6 +418,13 @@ public class Projects {
     private void cancelQueuedJob(UUID projectId) {
         db.update("UPDATE project.analysis_job SET state='CANCELLED',finished_at=now() " +
                 "WHERE project_id=? AND state='QUEUED'", projectId);
+    }
+
+    private void cancelActiveJobs(UUID projectId) {
+        db.update("UPDATE project.analysis_job SET state='CANCELLED',finished_at=now()," +
+                "repository_progress=(SELECT COALESCE(jsonb_agg(jsonb_set(x,'{state}','\"CANCELLED\"'::jsonb))," +
+                "'[]'::jsonb) FROM jsonb_array_elements(repository_progress) x) " +
+                "WHERE project_id=? AND state IN ('QUEUED','RUNNING')", projectId);
     }
 
     private void insertMembers(UUID projectId, UUID owner, List<Repository> repositories) {
@@ -305,12 +472,28 @@ public class Projects {
         }
     }
 
+    private boolean accessible(UUID owner, Member member) {
+        if (!"PRIVATE".equals(member.visibility())) return true;
+        try { checkPrivateAccess(owner, List.of(member)); return true; }
+        catch (ApiProblem e) { return false; }
+    }
+
+    private List<Member> redact(UUID owner, List<Member> members) {
+        return members.stream().map(m -> accessible(owner, m) ? m : new Member(m.id(), null, null,
+                m.visibility(), "BLOCKED", m.analysisStatus(), null)).toList();
+    }
+
     private List<Member> membersForQueued(UUID projectId) {
         return db.query("SELECT id,github_repository_id,repository_full_name,visibility,access_state " +
                         "FROM project.project_repository WHERE project_id=? AND removed_at IS NULL " +
                         "ORDER BY added_at,id",
                 (rs, row) -> new Member(rs.getObject(1, UUID.class), rs.getString(2), rs.getString(3),
                         rs.getString(4), rs.getString(5), "QUEUED", null), projectId);
+    }
+
+    private String latestStatus(UUID projectId) {
+        return safeStatus(db.queryForObject("SELECT state FROM project.analysis_job WHERE project_id=? " +
+                "ORDER BY created_at DESC,id DESC LIMIT 1", String.class, projectId));
     }
 
     private void insertJob(UUID projectId, long version, String trigger, List<Member> members,

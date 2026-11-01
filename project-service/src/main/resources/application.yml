@@ -38,6 +38,7 @@ devfield:
       api-timeout-seconds: ${PROJECT_GITHUB_API_TIMEOUT_SECONDS:8}
       private-registration-enabled: ${PROJECT_PRIVATE_REGISTRATION_ENABLED:false}
       private-consent-policy-version: ${PROJECT_PRIVATE_CONSENT_POLICY_VERSION:}
+      webhook-secret: ${PROJECT_GITHUB_WEBHOOK_SECRET:}
 
 management:
   endpoints:
