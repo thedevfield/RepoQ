@@ -1,8 +1,9 @@
 package dev.devfield.repoq.project.api;
 
-import com.fasterxml.jackson.databind.JsonNode;
+import tools.jackson.databind.JsonNode;
 import dev.devfield.repoq.project.data.Projects;
 import dev.devfield.repoq.project.github.GitHubRepositoryClient;
+import dev.devfield.repoq.project.github.GitHubConnections;
 import dev.devfield.repoq.project.github.GitHubUrl;
 import dev.devfield.repoq.project.security.AuthSessionVerifier;
 import java.net.URI;
@@ -12,7 +13,9 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Comparator;
 import java.util.UUID;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -34,15 +37,25 @@ public class ProjectsController {
     public record RegisterRequest(String repositoryUrl, String name, List<RepositoryInput> repositories,
                                   String githubRepositoryId, JsonNode consents) {}
     public record AddRequest(List<RepositoryInput> repositories) {}
+    private record Input(GitHubUrl url, String id, List<Projects.Consent> consents) {}
 
     private final AuthSessionVerifier sessions;
     private final GitHubRepositoryClient github;
     private final Projects projects;
+    private final GitHubConnections connections;
+    private final boolean privateEnabled;
+    private final String policyVersion;
 
-    public ProjectsController(AuthSessionVerifier sessions, GitHubRepositoryClient github, Projects projects) {
+    public ProjectsController(AuthSessionVerifier sessions, GitHubRepositoryClient github, Projects projects,
+                              GitHubConnections connections,
+                              @Value("${devfield.project.github.private-registration-enabled:false}") String enabled,
+                              @Value("${devfield.project.github.private-consent-policy-version:}") String policyVersion) {
         this.sessions = sessions;
         this.github = github;
         this.projects = projects;
+        this.connections = connections;
+        this.privateEnabled = "true".equals(enabled);
+        this.policyVersion = policyVersion;
     }
 
     @PostMapping
@@ -65,17 +78,17 @@ public class ProjectsController {
         if (requestedName != null && (requestedName.isBlank() || requestedName.length() > 100))
             throw new ApiProblem(HttpStatus.BAD_REQUEST, "invalid_name");
         String safeKey = checkKey(key);
-        var urls = parsePublic(inputs);
+        var normalized = parse(inputs);
         UUID owner = UUID.fromString(jwt.getSubject());
-        String hash = fingerprint(requestedName == null ? "<default>" : requestedName, urls);
+        String hash = fingerprint(requestedName == null ? "<default>" : requestedName, normalized);
         if (safeKey != null) {
             var replay = projects.replayRegistration(owner, safeKey, hash);
             if (replay != null)
                 return ResponseEntity.created(URI.create("/api/projects/" + replay.id())).body(replay);
         }
-        var repositories = fetchPublic(urls);
-        String name = requestedName == null ? repositories.getFirst().name() : requestedName;
-        var result = projects.register(owner, repositories, name, safeKey, hash);
+        var repositories = fetch(owner, normalized);
+        String name = requestedName == null ? repositories.getFirst().identity().name() : requestedName;
+        var result = projects.registerMixed(owner, repositories, name, safeKey, hash);
         return ResponseEntity.created(URI.create("/api/projects/" + result.id())).body(result);
     }
 
@@ -104,14 +117,14 @@ public class ProjectsController {
         UUID owner = UUID.fromString(jwt.getSubject());
         projects.requireOwned(owner, id);
         String safeKey = checkKey(key);
-        var urls = parsePublic(request.repositories());
-        String hash = fingerprint("ADD", urls);
+        var normalized = parse(request.repositories());
+        String hash = fingerprint("ADD", normalized);
         if (safeKey != null) {
             var replay = projects.replayAddition(owner, id, safeKey, hash);
             if (replay != null) return ResponseEntity.status(HttpStatus.CREATED).body(replay);
         }
-        var repositories = fetchPublic(urls);
-        var result = projects.add(owner, id, repositories, safeKey, hash);
+        var repositories = fetch(owner, normalized);
+        var result = projects.addMixed(owner, id, repositories, safeKey, hash);
         return ResponseEntity.status(HttpStatus.CREATED).body(result);
     }
 
@@ -124,21 +137,57 @@ public class ProjectsController {
         return ResponseEntity.noContent().build();
     }
 
-    private List<GitHubUrl> parsePublic(List<RepositoryInput> inputs) {
+    private List<Input> parse(List<RepositoryInput> inputs) {
         if (inputs == null || inputs.isEmpty() || inputs.size() > 20) throw invalid();
-        var result = new ArrayList<GitHubUrl>(inputs.size());
+        var result = new ArrayList<Input>(inputs.size());
         for (RepositoryInput input : inputs) {
-            if (input == null || input.githubRepositoryId() != null || input.consents() != null ||
-                    (input.visibility() != null && !"PUBLIC".equals(input.visibility())))
+            if (input == null) throw invalid();
+            if (input.githubRepositoryId() != null) {
+                if (!privateEnabled) throw new ApiProblem(HttpStatus.BAD_REQUEST, "private_repository_not_supported");
+                if (input.repositoryUrl() != null ||
+                        (input.visibility() != null && !"PRIVATE".equals(input.visibility())) ||
+                        !input.githubRepositoryId().matches("[1-9][0-9]{0,18}")) throw invalid();
+                result.add(new Input(null, input.githubRepositoryId(), consents(input.consents())));
+                continue;
+            }
+            if (input.consents() != null || (input.visibility() != null && !"PUBLIC".equals(input.visibility())))
                 throw new ApiProblem(HttpStatus.BAD_REQUEST, "private_repository_not_supported");
-            result.add(GitHubUrl.parse(input.repositoryUrl()));
+            result.add(new Input(GitHubUrl.parse(input.repositoryUrl()), null, List.of()));
         }
         return result;
     }
 
-    private List<GitHubRepositoryClient.Repository> fetchPublic(List<GitHubUrl> urls) {
-        var result = new ArrayList<GitHubRepositoryClient.Repository>(urls.size());
-        for (GitHubUrl url : urls) result.add(github.fetch(url.owner(), url.repo()));
+    private List<Projects.Consent> consents(JsonNode node) {
+        if (policyVersion.isBlank() || node == null || !node.isArray() || node.size() != 2) throw invalid();
+        var result = new ArrayList<Projects.Consent>(2);
+        for (JsonNode item : node) {
+            if (!item.isObject() || item.size() != 3 || !item.path("purpose").isTextual() ||
+                    !item.path("decision").isTextual() || !item.path("policyVersion").isTextual() ||
+                    !policyVersion.equals(item.path("policyVersion").asText())) throw invalid();
+            String purpose = item.path("purpose").asText(), decision = item.path("decision").asText();
+            if (!List.of("PRIVATE_COLLECTION", "EXTERNAL_AI").contains(purpose) ||
+                    !List.of("GRANTED", "DENIED").contains(decision) ||
+                    result.stream().anyMatch(c -> c.purpose().equals(purpose))) throw invalid();
+            result.add(new Projects.Consent(purpose, decision, policyVersion));
+        }
+        if (result.stream().noneMatch(c -> c.purpose().equals("PRIVATE_COLLECTION") && c.decision().equals("GRANTED")))
+            throw new ApiProblem(HttpStatus.FORBIDDEN, "private_collection_consent_required");
+        return result.stream().sorted(Comparator.comparing(Projects.Consent::purpose)).toList();
+    }
+
+    private List<Projects.Repository> fetch(UUID owner, List<Input> inputs) {
+        var result = new ArrayList<Projects.Repository>(inputs.size());
+        for (Input input : inputs) {
+            if (input.id() == null) {
+                var repository = github.fetch(input.url().owner(), input.url().repo());
+                result.add(new Projects.Repository(repository, null, List.of()));
+            } else {
+                var privateRepository = connections.privateRepository(owner, input.id());
+                var repository = privateRepository.repository();
+                result.add(new Projects.Repository(new GitHubRepositoryClient.Repository(
+                        input.id(), repository.fullName(), repository.name()), privateRepository.connectionId(), input.consents()));
+            }
+        }
         return result;
     }
 
@@ -149,15 +198,22 @@ public class ProjectsController {
         return key;
     }
 
-    private static String fingerprint(String label, List<GitHubUrl> urls) {
+    private static String fingerprint(String label, List<Input> inputs) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             digest.update(label.getBytes(StandardCharsets.UTF_8));
-            for (var url : urls) {
+            for (var input : inputs) {
                 digest.update((byte) 0);
-                digest.update(url.owner().toLowerCase(java.util.Locale.ROOT).getBytes(StandardCharsets.UTF_8));
-                digest.update((byte) '/');
-                digest.update(url.repo().toLowerCase(java.util.Locale.ROOT).getBytes(StandardCharsets.UTF_8));
+                if (input.id() == null) {
+                    digest.update(input.url().owner().toLowerCase(java.util.Locale.ROOT).getBytes(StandardCharsets.UTF_8));
+                    digest.update((byte) '/');
+                    digest.update(input.url().repo().toLowerCase(java.util.Locale.ROOT).getBytes(StandardCharsets.UTF_8));
+                } else {
+                    digest.update(("PRIVATE:" + input.id()).getBytes(StandardCharsets.UTF_8));
+                    for (var consent : input.consents())
+                        digest.update(("|" + consent.purpose() + ":" + consent.decision() + ":" +
+                                consent.policyVersion()).getBytes(StandardCharsets.UTF_8));
+                }
             }
             return HexFormat.of().formatHex(digest.digest());
         } catch (NoSuchAlgorithmException e) {

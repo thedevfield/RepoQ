@@ -177,6 +177,25 @@ class GitHubConnectionsIntegrationTest {
                 () -> service.callback(other, otherSession, "second", start.proof())).code());
     }
 
+    @Test
+    void privateRepositoryRequiresCurrentUserAndInstallationIntersection() {
+        authorize();
+        var install = service.start(user, session);
+        when(github.installationAccessible("access-value", 88, 345)).thenReturn(true);
+        when(github.repositories("access-value", 88, 1, 1)).thenReturn(new GitHubAppClient.RepositoryPage(List.of(), false));
+        service.setup(user, session, install.proof(), 88, "install");
+        when(github.repositories("access-value", 88, 1, 100)).thenReturn(new GitHubAppClient.RepositoryPage(
+                List.of(new GitHubAppClient.Repository(72, "org/private", "private", true)), false));
+        assertEquals(72, service.privateRepository(user, "72").repository().id());
+        assertEquals("github_access_denied", assertThrows(ApiProblem.class,
+                () -> service.requirePrivateRepository(user, "73")).code());
+        when(github.installationAccessible("access-value", 88, 345)).thenReturn(false);
+        assertEquals("github_access_denied", assertThrows(ApiProblem.class,
+                () -> service.requirePrivateRepository(user, "72")).code());
+        assertEquals("github_access_denied", assertThrows(ApiProblem.class,
+                () -> service.requirePrivateRepository(other, "72")).code());
+    }
+
     private void authorize() {
         var start = service.start(user, session);
         when(github.exchange(eq("code"), anyString(), anyString())).thenReturn(tokens());

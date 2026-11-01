@@ -36,6 +36,8 @@ devfield:
       token-key-version: ${PROJECT_GITHUB_TOKEN_KEY_VERSION:1}
       token-key: ${PROJECT_GITHUB_TOKEN_KEY:}
       api-timeout-seconds: ${PROJECT_GITHUB_API_TIMEOUT_SECONDS:8}
+      private-registration-enabled: ${PROJECT_PRIVATE_REGISTRATION_ENABLED:false}
+      private-consent-policy-version: ${PROJECT_PRIVATE_CONSENT_POLICY_VERSION:}
 
 management:
   endpoints:
