@@ -24,6 +24,7 @@ public class GitHubConnections {
     public record Start(String nextAction, String url, String proof, Instant expiresAt) {}
     public record Status(String userAuthorization, String installation) {}
     public record Listing(String status, java.util.List<GitHubAppClient.Repository> repositories, int page, boolean hasNext) {}
+    public record PrivateRepository(UUID connectionId, GitHubAppClient.Repository repository) {}
     private record Connection(UUID id, Long githubId, String userState, String installationState, Long installationId,
                               String access, String refresh, Instant accessExpiry, Instant refreshExpiry, Integer keyVersion) {}
     private record Attempt(UUID id, UUID user, UUID session, String kind, String verifier, Integer keyVersion) {}
@@ -162,6 +163,35 @@ public class GitHubConnections {
             }
             var result = github.repositories(token, c.installationId(), page, size);
             return new Listing("CONNECTED", result.repositories(), page, result.hasNext());
+        } catch (ApiProblem e) {
+            if (e.code().equals("github_reauthorization_required")) revokeUserToken(user);
+            throw e;
+        }
+    }
+
+    public UUID requirePrivateRepository(UUID user, String repositoryId) {
+        return privateRepository(user, repositoryId).connectionId();
+    }
+
+    public PrivateRepository privateRepository(UUID user, String repositoryId) {
+        if (repositoryId == null || !repositoryId.matches("[1-9][0-9]{0,18}")) throw invalid();
+        Connection c = connection(user, false);
+        if (c == null || !"AUTHORIZED".equals(c.userState()) ||
+                !"INSTALLED".equals(c.installationState()) || c.installationId() == null)
+            throw new ApiProblem(HttpStatus.FORBIDDEN, "github_access_denied");
+        String token = validToken(user);
+        try {
+            if (github.userId(token) != c.githubId() ||
+                    !github.installationAccessible(token, c.installationId(), appId))
+                throw new ApiProblem(HttpStatus.FORBIDDEN, "github_access_denied");
+            for (int page = 1; page <= 100; page++) {
+                var result = github.repositories(token, c.installationId(), page, 100);
+                for (var repository : result.repositories())
+                    if (Long.toString(repository.id()).equals(repositoryId) && repository.isPrivate())
+                        return new PrivateRepository(c.id(), repository);
+                if (!result.hasNext()) throw new ApiProblem(HttpStatus.FORBIDDEN, "github_access_denied");
+            }
+            throw new ApiProblem(HttpStatus.SERVICE_UNAVAILABLE, "github_pagination_limit");
         } catch (ApiProblem e) {
             if (e.code().equals("github_reauthorization_required")) revokeUserToken(user);
             throw e;

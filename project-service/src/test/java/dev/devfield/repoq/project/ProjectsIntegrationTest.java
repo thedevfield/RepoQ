@@ -124,6 +124,15 @@ class ProjectsIntegrationTest {
     }
 
     @Test
+    void privateRegistrationIsDisabledByDefault() throws Exception {
+        String privateRequest = "{\"repositories\":[{\"githubRepositoryId\":\"72\",\"consents\":[] }]}";
+        var response = call("POST", "/api/projects", "user-a", privateRequest);
+        assertEquals(400, response.statusCode());
+        assertEquals("private_repository_not_supported", json.readTree(response.body()).path("code").asText());
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM project.registered_project WHERE owner_user_id=?", Integer.class, userA));
+    }
+
+    @Test
     void uniqueRaceFenceAndRollback() throws Exception {
         var repository = new GitHubRepositoryClient.Repository("race-" + UUID.randomUUID(), "owner/repo", "repo");
         try (var pool = Executors.newFixedThreadPool(2)) {

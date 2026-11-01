@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.devfield.repoq.project.api.ApiProblem;
 import dev.devfield.repoq.project.github.GitHubRepositoryClient;
+import dev.devfield.repoq.project.github.GitHubConnections;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -26,11 +27,14 @@ public class Projects {
     public record Registration(UUID id, String analysisStatus, List<Member> repositories) {}
     public record Addition(UUID projectId, long membershipVersion, String analysisStatus,
                            List<Member> repositories) {}
+    public record Consent(String purpose, String decision, String policyVersion) {}
+    public record Repository(GitHubRepositoryClient.Repository identity, UUID connectionId, List<Consent> consents) {}
 
     private final JdbcTemplate db;
+    private final GitHubConnections connections;
     private final ObjectMapper json = new ObjectMapper();
 
-    public Projects(JdbcTemplate db) { this.db = db; }
+    public Projects(JdbcTemplate db, GitHubConnections connections) { this.db = db; this.connections = connections; }
 
     public Registration replayRegistration(UUID owner, String key, String hash) {
         var prior = db.query("SELECT p.create_request_hash,j.response_json::text,p.state,uf.state " +
@@ -45,7 +49,9 @@ public class Projects {
             throw new ApiProblem(HttpStatus.FORBIDDEN, "account_unavailable");
         if (!"ACTIVE".equals(prior.getFirst()[2])) throw conflict("project_unavailable");
         if (!hash.equals(prior.getFirst()[0])) throw conflict("idempotency_key_conflict");
-        return fromJson(prior.getFirst()[1], Registration.class);
+        Registration replay = fromJson(prior.getFirst()[1], Registration.class);
+        checkPrivateAccess(owner, replay.repositories());
+        return replay;
     }
 
     public Addition replayAddition(UUID owner, UUID projectId, String key, String hash) {
@@ -63,7 +69,9 @@ public class Projects {
         if (!"ACTIVE".equals(prior.getFirst()[2]) || !"ACTIVE".equals(prior.getFirst()[4]))
             throw conflict("project_unavailable");
         if (!hash.equals(prior.getFirst()[0])) throw conflict("idempotency_key_conflict");
-        return fromJson(prior.getFirst()[1], Addition.class);
+        Addition replay = fromJson(prior.getFirst()[1], Addition.class);
+        checkPrivateAccess(owner, replay.repositories());
+        return replay;
     }
 
     @Transactional
@@ -74,6 +82,13 @@ public class Projects {
     @Transactional
     public Registration register(UUID owner, List<GitHubRepositoryClient.Repository> repositories,
                                  String name, String requestKey, String requestHash) {
+        return registerMixed(owner, repositories.stream().map(r -> new Repository(r, null, List.of())).toList(),
+                name, requestKey, requestHash);
+    }
+
+    @Transactional
+    public Registration registerMixed(UUID owner, List<Repository> repositories,
+                                      String name, String requestKey, String requestHash) {
         requireRepositories(repositories);
         lockUser(owner);
         if (requestKey != null) {
@@ -81,7 +96,7 @@ public class Projects {
             if (replay != null) return replay;
         }
         UUID projectId = UUID.randomUUID();
-        var first = repositories.getFirst();
+        var first = repositories.getFirst().identity();
         try {
             db.update("INSERT INTO project.registered_project" +
                             "(id,owner_user_id,github_repository_id,repository_full_name,display_name," +
@@ -102,6 +117,13 @@ public class Projects {
     @Transactional
     public Addition add(UUID owner, UUID projectId, List<GitHubRepositoryClient.Repository> repositories,
                         String requestKey, String requestHash) {
+        return addMixed(owner, projectId, repositories.stream().map(r -> new Repository(r, null, List.of())).toList(),
+                requestKey, requestHash);
+    }
+
+    @Transactional
+    public Addition addMixed(UUID owner, UUID projectId, List<Repository> repositories,
+                             String requestKey, String requestHash) {
         requireRepositories(repositories);
         lockUser(owner);
         long version = lockProject(owner, projectId);
@@ -109,6 +131,11 @@ public class Projects {
             Addition replay = replayAddition(owner, projectId, requestKey, requestHash);
             if (replay != null) return replay;
         }
+        int existing = db.queryForObject("SELECT count(*) FROM project.project_repository " +
+                "WHERE project_id=? AND removed_at IS NULL", Integer.class, projectId);
+        if (existing + repositories.size() > 20)
+            throw new ApiProblem(HttpStatus.BAD_REQUEST, "invalid_repositories");
+        checkPrivateAccess(owner, privateMembers(owner, projectId));
         if (hasRunningJob(projectId)) throw conflict("analysis_in_progress");
         // A-stage QUEUED jobs have no worker. Replace one atomically so adding to a new project works.
         cancelQueuedJob(projectId);
@@ -130,11 +157,13 @@ public class Projects {
     public void remove(UUID owner, UUID projectId, UUID memberId) {
         lockUser(owner);
         long version = lockProject(owner, projectId);
-        var rows = db.query("SELECT removed_at IS NOT NULL FROM project.project_repository " +
+        var rows = db.query("SELECT removed_at IS NOT NULL,visibility FROM project.project_repository " +
                         "WHERE id=? AND project_id=? AND owner_user_id=? FOR UPDATE",
-                (rs, row) -> rs.getBoolean(1), memberId, projectId, owner);
+                (rs, row) -> new Object[]{rs.getBoolean(1), rs.getString(2)}, memberId, projectId, owner);
         if (rows.isEmpty()) throw new ApiProblem(HttpStatus.NOT_FOUND, "repository_not_found");
-        if (rows.getFirst()) return;
+        if ((Boolean) rows.getFirst()[0]) return;
+        if ("PRIVATE".equals(rows.getFirst()[1])) throw conflict("private_removal_not_supported");
+        checkPrivateAccess(owner, privateMembers(owner, projectId));
         int count = db.queryForObject("SELECT count(*) FROM project.project_repository " +
                 "WHERE project_id=? AND removed_at IS NULL", Integer.class, projectId);
         if (count <= 1) throw conflict("last_repository_required");
@@ -150,6 +179,7 @@ public class Projects {
     }
 
     public List<Item> list(UUID owner) {
+        checkPrivateAccess(owner, privateMembers(owner, null));
         return db.query("SELECT p.id,p.display_name,j.state," +
                         "(SELECT count(*) FROM project.project_repository r WHERE r.project_id=p.id AND r.removed_at IS NULL)," +
                         "(SELECT count(*) FROM project.project_repository r WHERE r.project_id=p.id " +
@@ -171,6 +201,7 @@ public class Projects {
                 (rs, row) -> new Object[]{rs.getObject(1, UUID.class), rs.getString(2), rs.getString(3),
                         rs.getLong(4), rs.getObject(5, UUID.class), rs.getString(6)}, owner, id);
         if (rows.isEmpty()) throw new ApiProblem(HttpStatus.NOT_FOUND, "project_not_found");
+        checkPrivateAccess(owner, privateMembers(owner, id));
         Object[] row = rows.getFirst();
         UUID jobId = (UUID) row[4];
         var members = db.query("SELECT r.id,r.github_repository_id,r.repository_full_name,r.visibility,r.access_state," +
@@ -229,13 +260,48 @@ public class Projects {
                 "WHERE project_id=? AND state='QUEUED'", projectId);
     }
 
-    private void insertMembers(UUID projectId, UUID owner,
-                               List<GitHubRepositoryClient.Repository> repositories) {
+    private void insertMembers(UUID projectId, UUID owner, List<Repository> repositories) {
         for (var repository : repositories) {
+            var identity = repository.identity();
+            if (repository.connectionId() != null &&
+                    !repository.connectionId().equals(connections.requirePrivateRepository(owner, identity.id())))
+                throw new ApiProblem(HttpStatus.FORBIDDEN, "private_access_unavailable");
             db.update("INSERT INTO project.project_repository" +
-                            "(id,project_id,owner_user_id,github_repository_id,repository_full_name,visibility) " +
-                            "VALUES (?,?,?,?,?,'PUBLIC')",
-                    UUID.randomUUID(), projectId, owner, repository.id(), repository.fullName());
+                            "(id,project_id,owner_user_id,github_repository_id,repository_full_name,visibility,github_connection_id) " +
+                            "VALUES (?,?,?,?,?,?,?)",
+                    UUID.randomUUID(), projectId, owner, identity.id(), identity.fullName(),
+                    repository.connectionId() == null ? "PUBLIC" : "PRIVATE", repository.connectionId());
+            for (Consent consent : repository.consents())
+                db.update("INSERT INTO project.repository_consent" +
+                                "(id,owner_user_id,github_repository_id,purpose,decision,policy_version) VALUES (?,?,?,?,?,?)",
+                        UUID.randomUUID(), owner, identity.id(), consent.purpose(), consent.decision(), consent.policyVersion());
+        }
+    }
+
+    private List<Member> privateMembers(UUID owner, UUID projectId) {
+        return db.query("SELECT id,github_repository_id,repository_full_name,visibility,access_state " +
+                        "FROM project.project_repository WHERE owner_user_id=? AND removed_at IS NULL " +
+                        "AND visibility='PRIVATE'" + (projectId == null ? "" : " AND project_id=?"),
+                (rs, row) -> new Member(rs.getObject(1, UUID.class), rs.getString(2), rs.getString(3),
+                        rs.getString(4), rs.getString(5), null, null),
+                projectId == null ? new Object[]{owner} : new Object[]{owner, projectId});
+    }
+
+    private void checkPrivateAccess(UUID owner, List<Member> members) {
+        for (Member member : members) {
+            if (!"PRIVATE".equals(member.visibility())) continue;
+            String consent = db.query("SELECT decision FROM project.repository_consent WHERE owner_user_id=? " +
+                            "AND github_repository_id=? AND purpose='PRIVATE_COLLECTION' " +
+                            "ORDER BY event_order DESC LIMIT 1",
+                    (rs, row) -> rs.getString(1), owner, member.githubRepositoryId()).stream().findFirst().orElse(null);
+            if (!"ACTIVE".equals(member.accessStatus()) || !"GRANTED".equals(consent))
+                throw new ApiProblem(HttpStatus.FORBIDDEN, "private_access_unavailable");
+            UUID boundConnection = db.query("SELECT github_connection_id FROM project.project_repository " +
+                            "WHERE id=? AND owner_user_id=? AND removed_at IS NULL AND visibility='PRIVATE'",
+                    (rs, row) -> rs.getObject(1, UUID.class), member.id(), owner).stream().findFirst().orElse(null);
+            if (boundConnection == null ||
+                    !boundConnection.equals(connections.requirePrivateRepository(owner, member.githubRepositoryId())))
+                throw new ApiProblem(HttpStatus.FORBIDDEN, "private_access_unavailable");
         }
     }
 
@@ -260,15 +326,16 @@ public class Projects {
                 response == null ? null : toJson(response));
     }
 
-    private static void requireRepositories(List<GitHubRepositoryClient.Repository> repositories) {
+    private static void requireRepositories(List<Repository> repositories) {
         if (repositories == null || repositories.isEmpty() || repositories.size() > 20)
             throw new ApiProblem(HttpStatus.BAD_REQUEST, "invalid_repositories");
         var ids = new HashSet<String>();
         for (var repository : repositories) {
-            if (repository == null || repository.id() == null || repository.id().isBlank() ||
-                    repository.fullName() == null || repository.fullName().isBlank())
+            if (repository == null || repository.identity() == null || repository.identity().id() == null ||
+                    repository.identity().id().isBlank() || repository.identity().fullName() == null ||
+                    repository.identity().fullName().isBlank())
                 throw new ApiProblem(HttpStatus.BAD_REQUEST, "invalid_repositories");
-            if (!ids.add(repository.id())) throw conflict("repository_already_registered");
+            if (!ids.add(repository.identity().id())) throw conflict("repository_already_registered");
         }
     }
 
