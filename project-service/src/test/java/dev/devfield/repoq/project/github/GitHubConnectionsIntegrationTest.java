@@ -36,6 +36,7 @@ class GitHubConnectionsIntegrationTest {
     @Autowired GitHubConnections service;
     @Autowired JdbcTemplate db;
     @Autowired TokenCipher cipher;
+    @Autowired dev.devfield.repoq.project.data.Projects projects;
     @MockitoBean GitHubAppClient github;
     UUID user = UUID.randomUUID();
     UUID session = UUID.randomUUID();
@@ -44,6 +45,7 @@ class GitHubConnectionsIntegrationTest {
     @AfterEach
     void cleanup() {
         db.update("DELETE FROM project.github_connection_attempt WHERE devfield_user_id IN (?,?)", user, other);
+        db.update("DELETE FROM project.project_write_fence WHERE owner_user_id IN (?,?)", user, other);
         db.update("DELETE FROM project.github_connection WHERE devfield_user_id IN (?,?)", user, other);
     }
 
@@ -194,6 +196,78 @@ class GitHubConnectionsIntegrationTest {
                 () -> service.requirePrivateRepository(user, "72")).code());
         assertEquals("github_access_denied", assertThrows(ApiProblem.class,
                 () -> service.requirePrivateRepository(other, "72")).code());
+    }
+
+    @Test
+    void staleCallbackCannotRestoreTokenAfterDisconnect() {
+        var start = service.start(user, session);
+        UUID id = service.status(user).connectionId();
+        projects.disconnect(user, id);
+        when(github.exchange(eq("code"), anyString(), anyString())).thenReturn(tokens());
+        when(github.userId("access-value")).thenReturn(900L);
+        assertEquals("github_attempt_invalid", assertThrows(ApiProblem.class,
+                () -> service.callback(user, session, "code", start.proof())).code());
+        assertEquals("DISCONNECTED", service.status(user).userAuthorization());
+        assertNull(db.queryForObject("SELECT access_token_ciphertext FROM project.github_connection WHERE id=?",
+                String.class, id));
+        var fresh = service.start(user, session);
+        assertEquals("AUTHORIZED", service.callback(user, session, "code", fresh.proof()).userAuthorization());
+    }
+
+    @Test
+    void staleSetupCannotRestoreInstallationAfterDisconnect() {
+        authorize();
+        var install = service.start(user, session);
+        UUID id = service.status(user).connectionId();
+        projects.disconnect(user, id);
+        assertThrows(ApiProblem.class, () -> service.setup(user, session, install.proof(), 51, "install"));
+        assertEquals("DISCONNECTED", service.status(user).userAuthorization());
+        assertNull(db.queryForObject("SELECT installation_id FROM project.github_connection WHERE id=?", Long.class, id));
+    }
+
+    @Test
+    void unavailableStoredKeyVersionFailsClosed() {
+        authorize();
+        db.update("UPDATE project.github_connection SET installation_state='INSTALLED',installation_id=88," +
+                "token_key_version=2 WHERE devfield_user_id=?", user);
+        assertEquals("github_key_version_unavailable", assertThrows(ApiProblem.class,
+                () -> service.requirePrivateRepository(user, "72")).code());
+    }
+
+    @Test
+    void disconnectWinsAfterConcurrentTokenRefresh() throws Exception {
+        authorize();
+        var install = service.start(user, session);
+        when(github.installationAccessible("access-value", 88, 345)).thenReturn(true);
+        when(github.repositories("access-value", 88, 1, 1)).thenReturn(
+                new GitHubAppClient.RepositoryPage(List.of(), false));
+        service.setup(user, session, install.proof(), 88, "install");
+        db.update("UPDATE project.github_connection SET token_expires_at=now()-interval '1 second' " +
+                "WHERE devfield_user_id=?", user);
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        when(github.refresh("refresh-value")).thenAnswer(call -> {
+            entered.countDown();
+            if (!release.await(10, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("refresh timeout");
+            return new GitHubAppClient.Tokens("new-access", "new-refresh",
+                    Instant.now().plusSeconds(3600), Instant.now().plusSeconds(7200));
+        });
+        when(github.userId("new-access")).thenReturn(900L);
+        when(github.installationAccessible("new-access", 88, 345)).thenReturn(true);
+        when(github.repositories("new-access", 88, 1, 30)).thenReturn(
+                new GitHubAppClient.RepositoryPage(List.of(), false));
+        UUID id = service.status(user).connectionId();
+        try (var pool = Executors.newFixedThreadPool(2)) {
+            var listing = pool.submit(() -> service.repositories(user, 1, 30));
+            assertTrue(entered.await(10, java.util.concurrent.TimeUnit.SECONDS));
+            var disconnect = pool.submit(() -> projects.disconnect(user, id));
+            release.countDown();
+            listing.get();
+            disconnect.get();
+        }
+        assertEquals("DISCONNECTED", service.status(user).userAuthorization());
+        assertNull(db.queryForObject("SELECT access_token_ciphertext FROM project.github_connection WHERE id=?",
+                String.class, id));
     }
 
     private void authorize() {

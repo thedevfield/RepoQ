@@ -38,7 +38,8 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
         "devfield.project.auth.session-check-uri=http://127.0.0.1:1/internal/auth/session-check",
         "devfield.project.auth.service-key=test-service-key",
         "devfield.project.github.private-registration-enabled=true",
-        "devfield.project.github.private-consent-policy-version=test-v1"
+        "devfield.project.github.private-consent-policy-version=test-v1",
+        "devfield.project.github.webhook-secret=test-webhook-secret"
 })
 class PrivateProjectsIntegrationTest {
     @Value("${local.server.port}") int port;
@@ -52,16 +53,18 @@ class PrivateProjectsIntegrationTest {
     private final UUID connectionId = UUID.randomUUID();
     private final ObjectMapper json = new ObjectMapper();
     private final HttpClient http = HttpClient.newHttpClient();
+    private UUID deliveryId;
     private static final String PRIVATE = "{\"githubRepositoryId\":\"72\",\"consents\":[" +
             "{\"purpose\":\"PRIVATE_COLLECTION\",\"decision\":\"GRANTED\",\"policyVersion\":\"test-v1\"}," +
             "{\"purpose\":\"EXTERNAL_AI\",\"decision\":\"DENIED\",\"policyVersion\":\"test-v1\"}]}";
 
     @AfterEach
     void cleanup() {
+        if (deliveryId != null) db.update("DELETE FROM project.github_webhook_delivery WHERE delivery_id=?", deliveryId);
         db.update("DELETE FROM project.analysis_job WHERE project_id IN (SELECT id FROM project.registered_project WHERE owner_user_id=?)", owner);
         db.update("DELETE FROM project.repository_consent WHERE owner_user_id=?", owner);
         db.update("DELETE FROM project.project_repository WHERE owner_user_id=?", owner);
-        db.update("DELETE FROM project.project_write_fence WHERE owner_user_id=?", owner);
+        db.update("DELETE FROM project.project_write_fence WHERE owner_user_id IN (?,?)", owner, other);
         db.update("DELETE FROM project.registered_project WHERE owner_user_id=?", owner);
         db.update("DELETE FROM project.github_connection WHERE devfield_user_id=?", owner);
     }
@@ -76,7 +79,7 @@ class PrivateProjectsIntegrationTest {
         db.update("INSERT INTO project.github_connection(id,devfield_user_id) VALUES (?,?)", connectionId, owner);
         when(connections.privateRepository(eq(owner), eq("72"))).thenReturn(new GitHubConnections.PrivateRepository(
                 connectionId, new GitHubAppClient.Repository(72, "org/private", "private", true)));
-        when(connections.requirePrivateRepository(owner, "72")).thenReturn(connectionId);
+        doReturn(connectionId).when(connections).requirePrivateRepository(owner, "72");
         when(connections.privateRepository(eq(owner), eq("73"))).thenReturn(new GitHubConnections.PrivateRepository(
                 connectionId, new GitHubAppClient.Repository(73, "org/second", "second", true)));
         when(connections.requirePrivateRepository(owner, "73")).thenReturn(connectionId);
@@ -103,12 +106,13 @@ class PrivateProjectsIntegrationTest {
         when(connections.requirePrivateRepository(owner, "72")).thenThrow(
                 new ApiProblem(HttpStatus.SERVICE_UNAVAILABLE, "github_unavailable"));
         var deniedDetail = call("GET", "/api/projects/" + project, "owner", null, null);
-        assertEquals(503, deniedDetail.statusCode());
+        assertEquals(200, deniedDetail.statusCode());
         assertFalse(deniedDetail.body().contains("org/private"));
+        assertFalse(deniedDetail.body().contains("\"githubRepositoryId\":\"72\""));
         var deniedList = call("GET", "/api/projects", "owner", null, null);
-        assertEquals(503, deniedList.statusCode());
+        assertEquals(200, deniedList.statusCode());
         assertFalse(deniedList.body().contains("org/private"));
-        assertEquals(503, call("POST", "/api/projects", "owner", mixed, "mixed-key").statusCode());
+        assertEquals(201, call("POST", "/api/projects", "owner", mixed, "mixed-key").statusCode());
     }
 
     @Test
@@ -144,10 +148,10 @@ class PrivateProjectsIntegrationTest {
         assertEquals(4, db.queryForObject("SELECT count(*) FROM project.repository_consent WHERE owner_user_id=?", Integer.class, owner));
         UUID member = db.queryForObject("SELECT id FROM project.project_repository WHERE owner_user_id=? " +
                 "AND github_repository_id='73'", UUID.class, owner);
-        assertEquals(409, call("DELETE", "/api/projects/" + id + "/repositories/" + member,
+        assertEquals(204, call("DELETE", "/api/projects/" + id + "/repositories/" + member,
                 "owner", null, null).statusCode());
         var many = new java.util.ArrayList<String>();
-        for (int repositoryId = 100; repositoryId < 119; repositoryId++) {
+        for (int repositoryId = 100; repositoryId < 120; repositoryId++) {
             String value = Integer.toString(repositoryId);
             when(connections.privateRepository(owner, value)).thenReturn(new GitHubConnections.PrivateRepository(
                     connectionId, new GitHubAppClient.Repository(repositoryId, "org/repo" + value, "repo" + value, true)));
@@ -182,6 +186,181 @@ class PrivateProjectsIntegrationTest {
         when(connections.privateRepository(other, "72")).thenThrow(
                 new ApiProblem(HttpStatus.FORBIDDEN, "github_access_denied"));
         assertEquals(403, call("POST", "/api/projects", "other", request, null).statusCode());
+    }
+
+    @Test
+    void revokeBlocksPrivateButPreservesPublicAndRepeats() throws Exception {
+        prepare();
+        String mixed = "{\"repositories\":[{\"repositoryUrl\":\"https://github.com/owner/repo\"}," + PRIVATE + "]}";
+        var created = call("POST", "/api/projects", "owner", mixed, null);
+        assertEquals(201, created.statusCode(), created.body());
+        UUID project = UUID.fromString(json.readTree(created.body()).path("id").asText());
+        when(connections.requirePrivateRepository(owner, "72")).thenThrow(
+                new ApiProblem(HttpStatus.FORBIDDEN, "github_access_denied"));
+        String revoked = "{\"consents\":[" +
+                "{\"purpose\":\"PRIVATE_COLLECTION\",\"decision\":\"REVOKED\",\"policyVersion\":\"test-v1\"}," +
+                "{\"purpose\":\"EXTERNAL_AI\",\"decision\":\"DENIED\",\"policyVersion\":\"test-v1\"}]}";
+        var first = call("PUT", "/api/github/repositories/72/consents", "owner", revoked, null);
+        assertEquals(202, first.statusCode(), first.body());
+        assertEquals(403, call("PUT", "/api/github/repositories/72/consents", "other", revoked, null).statusCode());
+        var repeat = call("PUT", "/api/github/repositories/72/consents", "owner", revoked, null);
+        assertEquals(202, repeat.statusCode());
+        assertEquals(json.readTree(first.body()).path("revocationId"), json.readTree(repeat.body()).path("revocationId"));
+        assertEquals(1, db.queryForObject("SELECT count(*) FROM project.repository_consent WHERE owner_user_id=? " +
+                "AND purpose='PRIVATE_COLLECTION' AND decision='REVOKED'", Integer.class, owner));
+        assertEquals("BLOCKED", db.queryForObject("SELECT access_state FROM project.project_repository " +
+                "WHERE owner_user_id=? AND github_repository_id='72'", String.class, owner));
+        var detail = call("GET", "/api/projects/" + project, "owner", null, null);
+        assertEquals(200, detail.statusCode());
+        assertTrue(detail.body().contains("owner/repo"));
+        assertFalse(detail.body().contains("org/private"));
+        when(publicGithub.fetch("owner", "repo2")).thenReturn(
+                new GitHubRepositoryClient.Repository("124", "owner/repo2", "repo2"));
+        assertEquals(201, call("POST", "/api/projects/" + project + "/repositories", "owner",
+                "{\"repositories\":[{\"repositoryUrl\":\"https://github.com/owner/repo2\"}]}", null).statusCode());
+        doReturn(connectionId).when(connections).requirePrivateRepository(owner, "72");
+        String granted = revoked.replace("\"purpose\":\"PRIVATE_COLLECTION\",\"decision\":\"REVOKED\"",
+                "\"purpose\":\"PRIVATE_COLLECTION\",\"decision\":\"GRANTED\"");
+        assertEquals(200, call("PUT", "/api/github/repositories/72/consents", "owner", granted, null).statusCode());
+        assertEquals("ACTIVE", db.queryForObject("SELECT access_state FROM project.project_repository " +
+                "WHERE owner_user_id=? AND github_repository_id='72'", String.class, owner));
+    }
+
+    @Test
+    void disconnectDiscardsTokensAndBlocksPrivate() throws Exception {
+        prepare();
+        var created = call("POST", "/api/projects", "owner", "{\"repositories\":[" + PRIVATE + "]}", null);
+        assertEquals(201, created.statusCode());
+        db.update("UPDATE project.github_connection SET user_state='REAUTHORIZE' WHERE id=?", connectionId);
+        var first = call("DELETE", "/api/github/connections/" + connectionId, "owner", null, null);
+        assertEquals(202, first.statusCode(), first.body());
+        assertEquals(202, call("DELETE", "/api/github/connections/" + connectionId, "owner", null, null).statusCode());
+        assertEquals("DISCONNECTED", db.queryForObject("SELECT user_state FROM project.github_connection WHERE id=?",
+                String.class, connectionId));
+        assertEquals(1L, db.queryForObject("SELECT generation FROM project.github_connection WHERE id=?",
+                Long.class, connectionId));
+        assertEquals(404, call("DELETE", "/api/github/connections/" + connectionId, "other", null, null).statusCode());
+    }
+
+    @Test
+    void signedWebhookIsDeduplicatedAndBlocksInstallation() throws Exception {
+        prepare();
+        assertEquals(201, call("POST", "/api/projects", "owner", "{\"repositories\":[" + PRIVATE + "]}", null).statusCode());
+        db.update("UPDATE project.github_connection SET user_state='AUTHORIZED',github_user_id=900," +
+                "installation_state='INSTALLED',installation_id=51,access_token_ciphertext='test'," +
+                "refresh_token_ciphertext='test',token_expires_at=now()+interval '1 hour'," +
+                "refresh_expires_at=now()+interval '1 hour',token_key_version=1 WHERE id=?", connectionId);
+        String payload = "{\"action\":\"deleted\",\"installation\":{\"id\":51}}";
+        deliveryId = UUID.randomUUID();
+        assertEquals(403, webhook(payload, "sha256=" + "0".repeat(64)).statusCode());
+        assertEquals(204, webhook(payload, signature(payload)).statusCode());
+        assertEquals(204, webhook(payload, signature(payload)).statusCode());
+        assertEquals(409, webhook("{}", signature("{}")).statusCode());
+        assertEquals(1, db.queryForObject("SELECT count(*) FROM project.github_webhook_delivery WHERE delivery_id=?",
+                Integer.class, deliveryId));
+        assertEquals("BLOCKED", db.queryForObject("SELECT access_state FROM project.project_repository " +
+                "WHERE owner_user_id=?", String.class, owner));
+    }
+
+    @Test
+    void runningJobDoesNotPreventRevocationAndDecisionsRollbackTogether() throws Exception {
+        prepare();
+        assertEquals(201, call("POST", "/api/projects", "owner", "{\"repositories\":[" + PRIVATE + "]}", null).statusCode());
+        UUID project = db.queryForObject("SELECT id FROM project.registered_project WHERE owner_user_id=?", UUID.class, owner);
+        db.update("UPDATE project.analysis_job SET state='RUNNING',started_at=now() WHERE project_id=?", project);
+        String invalid = "{\"consents\":[" +
+                "{\"purpose\":\"PRIVATE_COLLECTION\",\"decision\":\"REVOKED\",\"policyVersion\":\"test-v1\"}," +
+                "{\"purpose\":\"EXTERNAL_AI\",\"decision\":\"REVOKED\",\"policyVersion\":\"test-v1\"}]}";
+        assertEquals(403, call("PUT", "/api/github/repositories/72/consents", "owner", invalid, null).statusCode());
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM project.repository_consent WHERE owner_user_id=? " +
+                "AND decision='REVOKED'", Integer.class, owner));
+        assertEquals("RUNNING", db.queryForObject("SELECT state FROM project.analysis_job WHERE project_id=?",
+                String.class, project));
+        String valid = invalid.replace("\"purpose\":\"EXTERNAL_AI\",\"decision\":\"REVOKED\"",
+                "\"purpose\":\"EXTERNAL_AI\",\"decision\":\"DENIED\"");
+        assertEquals(202, call("PUT", "/api/github/repositories/72/consents", "owner", valid, null).statusCode());
+        assertEquals("CANCELLED", db.queryForObject("SELECT state FROM project.analysis_job WHERE project_id=?",
+                String.class, project));
+        assertEquals(2L, db.queryForObject("SELECT membership_version FROM project.registered_project WHERE id=?",
+                Long.class, project));
+    }
+
+    @Test
+    void selectedRepositoryChangeAndAuthorizationRevocationBlockAccess() throws Exception {
+        prepare();
+        assertEquals(201, call("POST", "/api/projects", "owner", "{\"repositories\":[" + PRIVATE + "]}", null).statusCode());
+        db.update("UPDATE project.github_connection SET user_state='AUTHORIZED',github_user_id=900," +
+                "installation_state='INSTALLED',installation_id=51,access_token_ciphertext='test'," +
+                "refresh_token_ciphertext='test',token_expires_at=now()+interval '1 hour'," +
+                "refresh_expires_at=now()+interval '1 hour',token_key_version=1 WHERE id=?", connectionId);
+        deliveryId = UUID.randomUUID();
+        String payload = "{\"action\":\"added\",\"installation\":{\"id\":51}," +
+                "\"repository_selection\":\"selected\",\"repositories_removed\":[]}";
+        assertEquals(204, webhook(payload, signature(payload), "installation_repositories").statusCode());
+        assertEquals("BLOCKED", db.queryForObject("SELECT access_state FROM project.project_repository " +
+                "WHERE owner_user_id=?", String.class, owner));
+        db.update("DELETE FROM project.github_webhook_delivery WHERE delivery_id=?", deliveryId);
+        deliveryId = UUID.randomUUID();
+        payload = "{\"action\":\"revoked\",\"sender\":{\"id\":900}}";
+        assertEquals(204, webhook(payload, signature(payload), "github_app_authorization").statusCode());
+        assertEquals("DISCONNECTED", db.queryForObject("SELECT user_state FROM project.github_connection WHERE id=?",
+                String.class, connectionId));
+        assertNull(db.queryForObject("SELECT access_token_ciphertext FROM project.github_connection WHERE id=?",
+                String.class, connectionId));
+    }
+
+    @Test
+    void invalidSignedDeliveryRollsBackItsRecord() throws Exception {
+        prepare();
+        deliveryId = UUID.randomUUID();
+        String invalid = "{\"action\":\"deleted\",\"installation\":{}}";
+        assertEquals(400, webhook(invalid, signature(invalid)).statusCode());
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM project.github_webhook_delivery WHERE delivery_id=?",
+                Integer.class, deliveryId));
+    }
+
+    @Test
+    void externalAiRevocationKeepsCollectionAndBlockedPrivateAllowsPublicRemoval() throws Exception {
+        prepare();
+        String mixed = "{\"repositories\":[{\"repositoryUrl\":\"https://github.com/owner/repo\"}," + PRIVATE + "]}";
+        assertEquals(201, call("POST", "/api/projects", "owner", mixed, null).statusCode());
+        UUID project = db.queryForObject("SELECT id FROM project.registered_project WHERE owner_user_id=?", UUID.class, owner);
+        String granted = "{\"consents\":[" +
+                "{\"purpose\":\"PRIVATE_COLLECTION\",\"decision\":\"GRANTED\",\"policyVersion\":\"test-v1\"}," +
+                "{\"purpose\":\"EXTERNAL_AI\",\"decision\":\"GRANTED\",\"policyVersion\":\"test-v1\"}]}";
+        assertEquals(200, call("PUT", "/api/github/repositories/72/consents", "owner", granted, null).statusCode());
+        String revokeAi = granted.replace("\"purpose\":\"EXTERNAL_AI\",\"decision\":\"GRANTED\"",
+                "\"purpose\":\"EXTERNAL_AI\",\"decision\":\"REVOKED\"");
+        assertEquals(202, call("PUT", "/api/github/repositories/72/consents", "owner", revokeAi, null).statusCode());
+        assertEquals("ACTIVE", db.queryForObject("SELECT access_state FROM project.project_repository " +
+                "WHERE owner_user_id=? AND github_repository_id='72'", String.class, owner));
+        assertEquals("GRANTED", db.queryForObject("SELECT decision FROM project.repository_consent WHERE owner_user_id=? " +
+                "AND purpose='PRIVATE_COLLECTION' ORDER BY event_order DESC LIMIT 1", String.class, owner));
+        db.update("UPDATE project.project_repository SET access_state='BLOCKED' WHERE owner_user_id=? " +
+                "AND github_repository_id='72'", owner);
+        UUID publicMember = db.queryForObject("SELECT id FROM project.project_repository WHERE owner_user_id=? " +
+                "AND visibility='PUBLIC'", UUID.class, owner);
+        assertEquals(204, call("DELETE", "/api/projects/" + project + "/repositories/" + publicMember,
+                "owner", null, null).statusCode());
+    }
+
+    private HttpResponse<String> webhook(String body, String signature) throws Exception {
+        return webhook(body, signature, "installation");
+    }
+
+    private HttpResponse<String> webhook(String body, String signature, String event) throws Exception {
+        var request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/api/github/webhook"))
+                .header("X-Hub-Signature-256", signature).header("X-GitHub-Delivery", deliveryId.toString())
+                .header("X-GitHub-Event", event).header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(body)).build();
+        return http.send(request, HttpResponse.BodyHandlers.ofString());
+    }
+
+    private String signature(String body) throws Exception {
+        var mac = javax.crypto.Mac.getInstance("HmacSHA256");
+        mac.init(new javax.crypto.spec.SecretKeySpec("test-webhook-secret".getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                "HmacSHA256"));
+        return "sha256=" + java.util.HexFormat.of().formatHex(mac.doFinal(body.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
     }
 
     private HttpResponse<String> call(String method, String path, String token, String body, String key) throws Exception {

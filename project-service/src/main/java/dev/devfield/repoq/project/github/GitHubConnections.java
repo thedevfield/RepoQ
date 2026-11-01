@@ -17,19 +17,25 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
 
 @Service
 public class GitHubConnections {
     private static final Logger log = LoggerFactory.getLogger(GitHubConnections.class);
     public record Start(String nextAction, String url, String proof, Instant expiresAt) {}
-    public record Status(String userAuthorization, String installation) {}
+    public record Status(String userAuthorization, String installation, UUID connectionId) {}
     public record Listing(String status, java.util.List<GitHubAppClient.Repository> repositories, int page, boolean hasNext) {}
     public record PrivateRepository(UUID connectionId, GitHubAppClient.Repository repository) {}
     private record Connection(UUID id, Long githubId, String userState, String installationState, Long installationId,
-                              String access, String refresh, Instant accessExpiry, Instant refreshExpiry, Integer keyVersion) {}
-    private record Attempt(UUID id, UUID user, UUID session, String kind, String verifier, Integer keyVersion) {}
+                              String access, String refresh, Instant accessExpiry, Instant refreshExpiry, Integer keyVersion,
+                              long generation) {}
+    private record Attempt(UUID id, UUID user, UUID session, String kind, String verifier, Integer keyVersion,
+                           UUID connectionId, long generation) {}
     private final JdbcTemplate db;
     private final TransactionTemplate tx;
+    private final TransactionTemplate tokenTx;
     private final GitHubAppClient github;
     private final TokenCipher cipher;
     private final SecureRandom random = new SecureRandom();
@@ -41,7 +47,8 @@ public class GitHubConnections {
     private final long ttl;
     private final long skew;
 
-    public GitHubConnections(JdbcTemplate db, TransactionTemplate tx, GitHubAppClient github, TokenCipher cipher,
+    public GitHubConnections(JdbcTemplate db, TransactionTemplate tx, PlatformTransactionManager transactionManager,
+            GitHubAppClient github, TokenCipher cipher,
             @Value("${devfield.project.github.client-id:}") String clientId,
             @Value("${devfield.project.github.callback-url:}") String callback,
             @Value("${devfield.project.github.setup-url:}") String setup,
@@ -50,6 +57,8 @@ public class GitHubConnections {
             @Value("${devfield.project.github.attempt-ttl-seconds:600}") long ttl,
             @Value("${devfield.project.github.user-token-refresh-skew-seconds:120}") long skew) {
         this.db = db; this.tx = tx; this.github = github; this.cipher = cipher;
+        this.tokenTx = new TransactionTemplate(transactionManager);
+        this.tokenTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
         this.clientId = clientId; this.callback = callback; this.setup = setup; this.install = install;
         this.appId = appId; this.ttl = ttl; this.skew = skew;
         if (ttl < 60 || ttl > 1800 || skew < 0 || skew > 3600) throw new IllegalArgumentException("Invalid GitHub lifecycle settings");
@@ -58,17 +67,25 @@ public class GitHubConnections {
     public Start start(UUID user, UUID session) {
         configured();
         cleanupExpiredAttempts();
-        Connection current = connection(user, false);
-        String kind = current == null || !"AUTHORIZED".equals(current.userState()) ? "AUTHORIZE_USER" : "INSTALL_APP";
         String proof = randomUrl(32);
         UUID id = UUID.randomUUID();
-        String verifier = kind.equals("AUTHORIZE_USER") ? randomUrl(32) : null;
         Instant expiry = Instant.now().plusSeconds(ttl);
-        db.update("INSERT INTO project.github_connection_attempt " +
-                "(id,devfield_user_id,devfield_session_id,state_hash,kind,pkce_verifier_ciphertext,key_version,expires_at) " +
-                "VALUES (?,?,?,?,?,?,?,?)", id, user, session, hash(proof), kind,
-                verifier == null ? null : cipher.encrypt(verifier, "attempt:" + id),
-                verifier == null ? null : cipher.version(), java.sql.Timestamp.from(expiry));
+        String[] values = tx.execute(s -> {
+            db.update("INSERT INTO project.github_connection(id,devfield_user_id) VALUES (?,?) " +
+                    "ON CONFLICT (devfield_user_id) DO NOTHING", UUID.randomUUID(), user);
+            Connection current = connection(user, true);
+            String kind = "AUTHORIZED".equals(current.userState()) ? "INSTALL_APP" : "AUTHORIZE_USER";
+            String verifier = kind.equals("AUTHORIZE_USER") ? randomUrl(32) : null;
+            db.update("INSERT INTO project.github_connection_attempt " +
+                    "(id,devfield_user_id,devfield_session_id,state_hash,kind,pkce_verifier_ciphertext," +
+                    "key_version,expires_at,connection_id,generation) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    id, user, session, hash(proof), kind,
+                    verifier == null ? null : cipher.encrypt(verifier, "attempt:" + id),
+                    verifier == null ? null : cipher.version(), java.sql.Timestamp.from(expiry),
+                    current.id(), current.generation());
+            return new String[]{kind, verifier};
+        });
+        String kind = values[0], verifier = values[1];
         String url = kind.equals("AUTHORIZE_USER")
                 ? "https://github.com/login/oauth/authorize?client_id=" + enc(clientId) + "&redirect_uri=" + enc(callback) +
                 "&state=" + enc(proof) + "&code_challenge=" + enc(Base64.getUrlEncoder().withoutPadding().encodeToString(hash(verifier))) +
@@ -100,6 +117,9 @@ public class GitHubConnections {
                 db.update("INSERT INTO project.github_connection (id,devfield_user_id) VALUES (?,?) ON CONFLICT (devfield_user_id) DO NOTHING",
                         UUID.randomUUID(), user);
                 Connection existing = connection(user, true);
+                if (existing == null || !existing.id().equals(attempt.connectionId()) ||
+                        existing.generation() != attempt.generation())
+                    throw new ApiProblem(HttpStatus.FORBIDDEN, "github_attempt_invalid");
                 if (existing.githubId() != null && existing.githubId() != githubId)
                     throw new ApiProblem(HttpStatus.CONFLICT, "github_account_conflict");
                 db.update("UPDATE project.github_connection SET github_user_id=?,user_state='AUTHORIZED'," +
@@ -121,7 +141,7 @@ public class GitHubConnections {
     public Status setup(UUID user, UUID session, String proof, long installationId, String action) {
         configured();
         if (installationId < 1 || action == null || !java.util.Set.of("install", "update").contains(action)) throw invalid();
-        consume(user, session, proof, "INSTALL_APP");
+        Attempt attempt = consume(user, session, proof, "INSTALL_APP");
         String token = validToken(user);
         boolean accessible;
         try {
@@ -130,21 +150,31 @@ public class GitHubConnections {
             accessible = github.installationAccessible(token, installationId, appId);
             if (accessible) github.repositories(token, installationId, 1, 1);
         } catch (ApiProblem e) {
-            if (e.code().equals("github_reauthorization_required")) revokeUserToken(user);
+            if (e.code().equals("github_reauthorization_required"))
+                tokenTx.executeWithoutResult(s -> revokeUserToken(user));
             throw e;
         }
-        db.update("UPDATE project.github_connection SET installation_state=?,installation_id=?,updated_at=now() " +
-                "WHERE devfield_user_id=? AND user_state='AUTHORIZED'",
-                accessible ? "INSTALLED" : "PENDING_APPROVAL", accessible ? installationId : null, user);
+        tx.executeWithoutResult(s -> {
+            Connection current = connection(user, true);
+            if (current == null || !current.id().equals(attempt.connectionId()) ||
+                    current.generation() != attempt.generation() || !"AUTHORIZED".equals(current.userState()))
+                throw new ApiProblem(HttpStatus.FORBIDDEN, "github_attempt_invalid");
+            db.update("UPDATE project.github_connection SET installation_state=?,installation_id=?,updated_at=now() " +
+                    "WHERE id=?", accessible ? "INSTALLED" : "PENDING_APPROVAL",
+                    accessible ? installationId : null, current.id());
+        });
         return status(user);
     }
 
     public Status status(UUID user) {
         Connection c = connection(user, false);
-        return c == null ? new Status("NOT_AUTHORIZED", "NOT_INSTALLED") : new Status(c.userState(), c.installationState());
+        return c == null ? new Status("NOT_AUTHORIZED", "NOT_INSTALLED", null) :
+                new Status(c.userState(), c.installationState(), c.id());
     }
 
+    @Transactional
     public Listing repositories(UUID user, int page, int size) {
+        lockUser(user);
         configured();
         if (page < 1 || page > 10000 || size < 1 || size > 100) throw invalid();
         Connection c = connection(user, false);
@@ -164,9 +194,19 @@ public class GitHubConnections {
             var result = github.repositories(token, c.installationId(), page, size);
             return new Listing("CONNECTED", result.repositories(), page, result.hasNext());
         } catch (ApiProblem e) {
-            if (e.code().equals("github_reauthorization_required")) revokeUserToken(user);
+            if (e.code().equals("github_reauthorization_required"))
+                tokenTx.executeWithoutResult(s -> revokeUserToken(user));
             throw e;
         }
+    }
+
+    private void lockUser(UUID user) {
+        db.update("INSERT INTO project.project_write_fence(id,scope,owner_user_id,state) " +
+                "VALUES (?,'USER',?,'ACTIVE') ON CONFLICT (owner_user_id) WHERE scope='USER' DO NOTHING",
+                UUID.randomUUID(), user);
+        String state = db.queryForObject("SELECT state FROM project.project_write_fence " +
+                "WHERE scope='USER' AND owner_user_id=? FOR UPDATE", String.class, user);
+        if (!"ACTIVE".equals(state)) throw new ApiProblem(HttpStatus.FORBIDDEN, "account_unavailable");
     }
 
     public UUID requirePrivateRepository(UUID user, String repositoryId) {
@@ -193,20 +233,22 @@ public class GitHubConnections {
             }
             throw new ApiProblem(HttpStatus.SERVICE_UNAVAILABLE, "github_pagination_limit");
         } catch (ApiProblem e) {
-            if (e.code().equals("github_reauthorization_required")) revokeUserToken(user);
+            if (e.code().equals("github_reauthorization_required"))
+                tokenTx.executeWithoutResult(s -> revokeUserToken(user));
             throw e;
         }
     }
 
     private void revokeUserToken(UUID user) {
-        db.update("UPDATE project.github_connection SET user_state='REAUTHORIZE',installation_state='NOT_INSTALLED'," +
+        db.update("UPDATE project.github_connection SET user_state='REAUTHORIZE',generation=generation+1," +
+                "installation_state='NOT_INSTALLED'," +
                 "installation_id=NULL,access_token_ciphertext=NULL,refresh_token_ciphertext=NULL," +
                 "token_expires_at=NULL,refresh_expires_at=NULL,token_key_version=NULL,updated_at=now() " +
-                "WHERE devfield_user_id=?", user);
+                "WHERE devfield_user_id=? AND user_state='AUTHORIZED'", user);
     }
 
     private String validToken(UUID user) {
-        String result = tx.execute(s -> {
+        String result = tokenTx.execute(s -> {
             Connection c = connection(user, true);
             if (c == null || !"AUTHORIZED".equals(c.userState())) return null;
             if (c.accessExpiry().isAfter(Instant.now().plusSeconds(skew)))
@@ -236,9 +278,11 @@ public class GitHubConnections {
         return tx.execute(s -> {
             var matches = db.query("UPDATE project.github_connection_attempt SET consumed_at=now() " +
                     "WHERE state_hash=? AND devfield_user_id=? AND devfield_session_id=? AND kind=? " +
-                    "AND consumed_at IS NULL AND expires_at>now() RETURNING id,devfield_user_id,devfield_session_id,kind,pkce_verifier_ciphertext,key_version",
+                    "AND consumed_at IS NULL AND expires_at>now() RETURNING id,devfield_user_id,devfield_session_id," +
+                    "kind,pkce_verifier_ciphertext,key_version,connection_id,generation",
                     (rs, row) -> new Attempt((UUID)rs.getObject(1), (UUID)rs.getObject(2), (UUID)rs.getObject(3),
-                            rs.getString(4), rs.getString(5), (Integer)rs.getObject(6)), hash(proof), user, session, kind);
+                            rs.getString(4), rs.getString(5), (Integer)rs.getObject(6),
+                            (UUID)rs.getObject(7), rs.getLong(8)), hash(proof), user, session, kind);
             if (matches.size() != 1) throw new ApiProblem(HttpStatus.FORBIDDEN, "github_attempt_invalid");
             return matches.getFirst();
         });
@@ -246,11 +290,13 @@ public class GitHubConnections {
 
     private Connection connection(UUID user, boolean lock) {
         var rows = db.query("SELECT id,github_user_id,user_state,installation_state,installation_id,access_token_ciphertext," +
-                "refresh_token_ciphertext,token_expires_at,refresh_expires_at,token_key_version FROM project.github_connection " +
+                "refresh_token_ciphertext,token_expires_at,refresh_expires_at,token_key_version,generation " +
+                "FROM project.github_connection " +
                 "WHERE devfield_user_id=?" + (lock ? " FOR UPDATE" : ""), (rs, row) -> new Connection(
                 (UUID)rs.getObject(1), (Long)rs.getObject(2), rs.getString(3), rs.getString(4), (Long)rs.getObject(5),
                 rs.getString(6), rs.getString(7), rs.getTimestamp(8) == null ? null : rs.getTimestamp(8).toInstant(),
-                rs.getTimestamp(9) == null ? null : rs.getTimestamp(9).toInstant(), (Integer)rs.getObject(10)), user);
+                rs.getTimestamp(9) == null ? null : rs.getTimestamp(9).toInstant(), (Integer)rs.getObject(10),
+                rs.getLong(11)), user);
         return rows.isEmpty() ? null : rows.getFirst();
     }
 

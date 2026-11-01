@@ -29,11 +29,13 @@ public class SecurityConfig {
                         .accessDeniedHandler((request, response, error) -> jsonError(response, 403, "forbidden")))
                 .authorizeHttpRequests(authorize -> authorize
                         .requestMatchers("/actuator/health", "/actuator/health/**").permitAll()
+                        .requestMatchers("/api/github/webhook").permitAll()
                         .requestMatchers("/api/projects", "/api/projects/*",
                                 "/api/projects/*/repositories", "/api/projects/*/repositories/*").authenticated()
                         .requestMatchers("/api/github/connections/start", "/api/github/connections/callback/complete",
                                 "/api/github/connections/setup/complete", "/api/github/connections",
-                                "/api/github/repositories").authenticated()
+                                "/api/github/repositories", "/api/github/repositories/*/consents",
+                                "/api/github/connections/*").authenticated()
                         .anyRequest().denyAll())
                 .oauth2ResourceServer(oauth -> oauth.jwt(jwt -> {}))
                 .build();
