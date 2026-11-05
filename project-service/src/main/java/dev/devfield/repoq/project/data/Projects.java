@@ -432,28 +432,9 @@ public class Projects {
         }
     }
 
-    private void lockUser(UUID owner) {
-        db.update("INSERT INTO project.project_write_fence(id,scope,owner_user_id,state) " +
-                        "VALUES (?,'USER',?,'ACTIVE') ON CONFLICT (owner_user_id) WHERE scope='USER' DO NOTHING",
-                UUID.randomUUID(), owner);
-        String state = db.queryForObject("SELECT state FROM project.project_write_fence " +
-                "WHERE scope='USER' AND owner_user_id=? FOR UPDATE", String.class, owner);
-        if (!"ACTIVE".equals(state)) throw new ApiProblem(HttpStatus.FORBIDDEN, "account_unavailable");
-    }
+    private void lockUser(UUID owner) { ProjectWriteFence.lockUser(db, owner); }
 
-    private long lockProject(UUID owner, UUID id) {
-        var fence = db.query("SELECT state FROM project.project_write_fence " +
-                        "WHERE scope='PROJECT' AND owner_user_id=? AND project_id=? FOR UPDATE",
-                (rs, row) -> rs.getString(1), owner, id);
-        if (fence.isEmpty()) throw new ApiProblem(HttpStatus.NOT_FOUND, "project_not_found");
-        if (!"ACTIVE".equals(fence.getFirst())) throw conflict("project_unavailable");
-        var projects = db.query("SELECT membership_version,state FROM project.registered_project " +
-                        "WHERE id=? AND owner_user_id=? FOR UPDATE",
-                (rs, row) -> new Object[]{rs.getLong(1), rs.getString(2)}, id, owner);
-        if (projects.isEmpty()) throw new ApiProblem(HttpStatus.NOT_FOUND, "project_not_found");
-        if (!"ACTIVE".equals(projects.getFirst()[1])) throw conflict("project_unavailable");
-        return (Long) projects.getFirst()[0];
-    }
+    private long lockProject(UUID owner, UUID id) { return ProjectWriteFence.lockProject(db, owner, id); }
 
     private boolean hasRunningJob(UUID projectId) {
         return Boolean.TRUE.equals(db.queryForObject("SELECT EXISTS (SELECT 1 FROM project.analysis_job " +

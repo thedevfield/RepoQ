@@ -16,6 +16,11 @@ spring:
 
 devfield:
   project:
+    analysis:
+      enabled: ${PROJECT_ANALYSIS_ENABLED:false}
+      max-attempts: ${PROJECT_ANALYSIS_MAX_ATTEMPTS:3}
+      lease-seconds: ${PROJECT_ANALYSIS_LEASE_SECONDS:60}
+      max-run-seconds: ${PROJECT_ANALYSIS_MAX_RUN_SECONDS:300}
     auth:
       issuer: ${PROJECT_AUTH_ISSUER:}
       audience: ${PROJECT_AUTH_AUDIENCE:}
