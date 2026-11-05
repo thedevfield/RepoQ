@@ -10,6 +10,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.UUID;
 import org.springframework.dao.DuplicateKeyException;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
@@ -30,13 +31,44 @@ public class Projects {
     public record Revocation(UUID revocationId, String status) {}
     public record Disconnection(UUID connectionId, String status) {}
     public record Consent(String purpose, String decision, String policyVersion) {}
+    public record ConsentStatus(String githubRepositoryId, String currentPolicyVersion,
+                                boolean consentSubmissionAvailable, List<Consent> consents) {}
     public record Repository(GitHubRepositoryClient.Repository identity, UUID connectionId, List<Consent> consents) {}
 
     private final JdbcTemplate db;
     private final GitHubConnections connections;
+    private final String policyVersion;
     private final ObjectMapper json = new ObjectMapper();
 
-    public Projects(JdbcTemplate db, GitHubConnections connections) { this.db = db; this.connections = connections; }
+    public Projects(JdbcTemplate db, GitHubConnections connections,
+                    @Value("${devfield.project.github.private-consent-policy-version:}") String policyVersion) {
+        this.db = db; this.connections = connections; this.policyVersion = policyVersion;
+    }
+
+    public ConsentStatus consentStatus(UUID owner, String repositoryId) {
+        if (repositoryId == null || !repositoryId.matches("[1-9][0-9]{0,18}"))
+            throw new ApiProblem(HttpStatus.BAD_REQUEST, "invalid_request");
+        var latest = db.query("SELECT DISTINCT ON (purpose) purpose,decision,policy_version " +
+                        "FROM project.repository_consent WHERE owner_user_id=? AND github_repository_id=? " +
+                        "ORDER BY purpose,event_order DESC",
+                (rs, n) -> new Consent(rs.getString(1), rs.getString(2), rs.getString(3)), owner, repositoryId);
+        var consents = new ArrayList<Consent>(2);
+        for (String purpose : List.of("PRIVATE_COLLECTION", "EXTERNAL_AI")) {
+            consents.add(latest.stream().filter(c -> purpose.equals(c.purpose())).findFirst()
+                    .orElse(new Consent(purpose, null, null)));
+        }
+        if (latest.isEmpty()) {
+            try { connections.requirePrivateRepository(owner, repositoryId); }
+            catch (ApiProblem e) {
+                if (e.status() == HttpStatus.FORBIDDEN || e.status() == HttpStatus.UNAUTHORIZED ||
+                        e.status() == HttpStatus.NOT_FOUND)
+                    throw new ApiProblem(HttpStatus.NOT_FOUND, "repository_not_found");
+                throw e;
+            }
+        }
+        return new ConsentStatus(repositoryId, policyVersion.isBlank() ? null : policyVersion,
+                !policyVersion.isBlank(), consents);
+    }
 
     @Transactional
     public Registration replayRegistration(UUID owner, String key, String hash) {
@@ -258,10 +290,10 @@ public class Projects {
         projects.forEach(id -> lockProject(owner, id));
         UUID revocationId = null;
         for (Consent decision : decisions) {
-            var prior = db.query("SELECT decision,revocation_id,cleanup_state FROM project.repository_consent " +
+            var prior = db.query("SELECT decision,revocation_id,cleanup_state,policy_version FROM project.repository_consent " +
                             "WHERE owner_user_id=? AND github_repository_id=? AND purpose=? " +
                             "ORDER BY event_order DESC LIMIT 1",
-                    (rs, n) -> new Object[]{rs.getString(1), rs.getObject(2, UUID.class), rs.getString(3)},
+                    (rs, n) -> new Object[]{rs.getString(1), rs.getObject(2, UUID.class), rs.getString(3), rs.getString(4)},
                     owner, repositoryId, decision.purpose());
             Object[] latest = prior.isEmpty() ? null : prior.getFirst();
             String old = latest == null ? null : (String) latest[0];
@@ -280,7 +312,7 @@ public class Projects {
             } else if ("GRANTED".equals(old) || "REVOKED".equals(old)) {
                 throw conflict("revocation_required");
             }
-            if (decision.decision().equals(old)) continue;
+            if (decision.decision().equals(old) && decision.policyVersion().equals(latest[3])) continue;
             db.update("INSERT INTO project.repository_consent" +
                             "(id,owner_user_id,github_repository_id,purpose,decision,policy_version,revocation_id,cleanup_state) " +
                             "VALUES (?,?,?,?,?,?,?,?)", UUID.randomUUID(), owner, repositoryId, decision.purpose(),
@@ -457,11 +489,14 @@ public class Projects {
     private void checkPrivateAccess(UUID owner, List<Member> members) {
         for (Member member : members) {
             if (!"PRIVATE".equals(member.visibility())) continue;
-            String consent = db.query("SELECT decision FROM project.repository_consent WHERE owner_user_id=? " +
+            Consent consent = db.query("SELECT decision,policy_version FROM project.repository_consent WHERE owner_user_id=? " +
                             "AND github_repository_id=? AND purpose='PRIVATE_COLLECTION' " +
                             "ORDER BY event_order DESC LIMIT 1",
-                    (rs, row) -> rs.getString(1), owner, member.githubRepositoryId()).stream().findFirst().orElse(null);
-            if (!"ACTIVE".equals(member.accessStatus()) || !"GRANTED".equals(consent))
+                    (rs, row) -> new Consent("PRIVATE_COLLECTION", rs.getString(1), rs.getString(2)),
+                    owner, member.githubRepositoryId()).stream().findFirst().orElse(null);
+            if (!"ACTIVE".equals(member.accessStatus()) || consent == null ||
+                    !"GRANTED".equals(consent.decision()) || !policyVersion.equals(consent.policyVersion()) ||
+                    policyVersion.isBlank())
                 throw new ApiProblem(HttpStatus.FORBIDDEN, "private_access_unavailable");
             UUID boundConnection = db.query("SELECT github_connection_id FROM project.project_repository " +
                             "WHERE id=? AND owner_user_id=? AND removed_at IS NULL AND visibility='PRIVATE'",

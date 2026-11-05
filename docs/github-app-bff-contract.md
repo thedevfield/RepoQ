@@ -61,6 +61,26 @@ user-accessible repositories within the verified App installation.
 
 The BFF should show separate user authorization and installation approval
 states. A fresh installation attempt is required after an approval-pending
-result. P-12/P-13 consent, disconnect, webhook revocation, and Private project
-registration follow in later stages. Actual GitHub browser E2E must run after
-the BFF is implemented.
+result. Actual GitHub browser E2E must run after the BFF is implemented.
+
+## Repository consent status
+
+`GET /api/github/repositories/{githubRepositoryId}/consents` uses the same
+DevField JWT/JWKS and AUTH-15 session check as P-12. The ID must be a positive
+decimal GitHub repository ID. The response contains only the ID, the configured
+`PROJECT_PRIVATE_CONSENT_POLICY_VERSION` (or `null` when unset),
+`consentSubmissionAvailable`, and the latest `decision` and `policyVersion` for
+each of `PRIVATE_COLLECTION` and `EXTERNAL_AI`. An absent decision has both
+values `null`. `consentSubmissionAvailable: false` means the server cannot
+accept a new consent; the BFF must not present submission as available. A
+previous `GRANTED` remains labeled with its original policy version and does
+not become a grant for the current version.
+
+The owner can read past decisions after losing GitHub access. With no owner
+history, the server checks current user and App access to that Private
+repository. Missing access returns `404 repository_not_found` without revealing
+whether the ID exists. A GitHub service failure remains an error, not a grant.
+The response never contains repository names, paths, tokens, or code. This API
+does not establish a legally approved policy text; that text requires separate
+approval. P-12 records a new event when the decision is repeated under a new
+server supported policy version, while an exact repeat adds no event.
