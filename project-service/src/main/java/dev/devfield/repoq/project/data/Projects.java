@@ -31,8 +31,9 @@ public class Projects {
     public record Revocation(UUID revocationId, String status) {}
     public record Disconnection(UUID connectionId, String status) {}
     public record Consent(String purpose, String decision, String policyVersion) {}
+    public record ConsentDecision(String purpose, String decision, String policyVersion, String cleanupState) {}
     public record ConsentStatus(String githubRepositoryId, String currentPolicyVersion,
-                                boolean consentSubmissionAvailable, List<Consent> consents) {}
+                                boolean consentSubmissionAvailable, List<ConsentDecision> consents) {}
     public record Repository(GitHubRepositoryClient.Repository identity, UUID connectionId, List<Consent> consents) {}
 
     private final JdbcTemplate db;
@@ -48,14 +49,15 @@ public class Projects {
     public ConsentStatus consentStatus(UUID owner, String repositoryId) {
         if (repositoryId == null || !repositoryId.matches("[1-9][0-9]{0,18}"))
             throw new ApiProblem(HttpStatus.BAD_REQUEST, "invalid_request");
-        var latest = db.query("SELECT DISTINCT ON (purpose) purpose,decision,policy_version " +
+        var latest = db.query("SELECT DISTINCT ON (purpose) purpose,decision,policy_version,cleanup_state " +
                         "FROM project.repository_consent WHERE owner_user_id=? AND github_repository_id=? " +
                         "ORDER BY purpose,event_order DESC",
-                (rs, n) -> new Consent(rs.getString(1), rs.getString(2), rs.getString(3)), owner, repositoryId);
-        var consents = new ArrayList<Consent>(2);
+                (rs, n) -> new ConsentDecision(rs.getString(1), rs.getString(2), rs.getString(3), rs.getString(4)),
+                owner, repositoryId);
+        var consents = new ArrayList<ConsentDecision>(2);
         for (String purpose : List.of("PRIVATE_COLLECTION", "EXTERNAL_AI")) {
             consents.add(latest.stream().filter(c -> purpose.equals(c.purpose())).findFirst()
-                    .orElse(new Consent(purpose, null, null)));
+                    .orElse(new ConsentDecision(purpose, null, null, null)));
         }
         if (latest.isEmpty()) {
             try { connections.requirePrivateRepository(owner, repositoryId); }
@@ -281,9 +283,11 @@ public class Projects {
     @Transactional
     public Revocation changeConsents(UUID owner, String repositoryId, List<Consent> decisions) {
         if (repositoryId == null || !repositoryId.matches("[1-9][0-9]{0,18}") || decisions == null ||
-                decisions.size() != 2 || decisions.stream().map(Consent::purpose).distinct().count() != 2 ||
-                decisions.stream().anyMatch(c -> !List.of("PRIVATE_COLLECTION", "EXTERNAL_AI").contains(c.purpose()) ||
-                        !List.of("GRANTED", "DENIED", "REVOKED").contains(c.decision())))
+                decisions.isEmpty() || decisions.size() > 2 || decisions.stream().anyMatch(c -> c == null ||
+                        !List.of("PRIVATE_COLLECTION", "EXTERNAL_AI").contains(c.purpose()) ||
+                        !List.of("GRANTED", "DENIED", "REVOKED").contains(c.decision())) ||
+                decisions.stream().map(Consent::purpose).distinct().count() != decisions.size() ||
+                decisions.size() == 1 && !"REVOKED".equals(decisions.getFirst().decision()))
             throw new ApiProblem(HttpStatus.BAD_REQUEST, "invalid_request");
         lockUser(owner);
         var projects = projectIds(owner, "r.github_repository_id=? AND r.visibility='PRIVATE'", repositoryId);
@@ -297,26 +301,38 @@ public class Projects {
                     owner, repositoryId, decision.purpose());
             Object[] latest = prior.isEmpty() ? null : prior.getFirst();
             String old = latest == null ? null : (String) latest[0];
-            if ("GRANTED".equals(decision.decision())) {
-                if (latest != null && "REVOKED".equals(old) && !"NO_DERIVED_DATA".equals(latest[2]))
-                    throw conflict("revocation_in_progress");
-                connections.requirePrivateRepository(owner, repositoryId);
-            } else if ("REVOKED".equals(decision.decision())) {
+            String eventPolicyVersion = decision.policyVersion();
+            if ("REVOKED".equals(decision.decision())) {
                 if (latest == null || !"GRANTED".equals(old) && !"REVOKED".equals(old))
                     throw new ApiProblem(HttpStatus.FORBIDDEN, "consent_not_owned");
                 if ("REVOKED".equals(old)) {
-                    revocationId = (UUID) latest[1];
+                    if (revocationId == null) revocationId = (UUID) latest[1];
                     continue;
                 }
                 if (revocationId == null) revocationId = UUID.randomUUID();
-            } else if ("GRANTED".equals(old) || "REVOKED".equals(old)) {
-                throw conflict("revocation_required");
+                eventPolicyVersion = (String) latest[3];
+            } else {
+                if (decision.decision().equals(old) && eventPolicyVersion != null && eventPolicyVersion.equals(latest[3]))
+                    continue;
+                if (policyVersion.isBlank() || !policyVersion.equals(eventPolicyVersion))
+                    throw new ApiProblem(HttpStatus.BAD_REQUEST, "invalid_request");
+                if ("GRANTED".equals(decision.decision())) {
+                    if ("REVOKED".equals(old) && !"NO_DERIVED_DATA".equals(latest[2]))
+                        throw conflict("revocation_in_progress");
+                    UUID connectionId = connections.requirePrivateRepository(owner, repositoryId);
+                    if (Boolean.TRUE.equals(db.queryForObject("SELECT EXISTS(SELECT 1 FROM project.project_repository " +
+                            "WHERE owner_user_id=? AND github_repository_id=? AND visibility='PRIVATE' " +
+                            "AND removed_at IS NULL AND github_connection_id<>?)", Boolean.class,
+                            owner, repositoryId, connectionId)))
+                        throw new ApiProblem(HttpStatus.FORBIDDEN, "private_access_unavailable");
+                } else if ("GRANTED".equals(old) || "REVOKED".equals(old)) {
+                    throw conflict("revocation_required");
+                }
             }
-            if (decision.decision().equals(old) && decision.policyVersion().equals(latest[3])) continue;
             db.update("INSERT INTO project.repository_consent" +
                             "(id,owner_user_id,github_repository_id,purpose,decision,policy_version,revocation_id,cleanup_state) " +
                             "VALUES (?,?,?,?,?,?,?,?)", UUID.randomUUID(), owner, repositoryId, decision.purpose(),
-                    decision.decision(), decision.policyVersion(),
+                    decision.decision(), eventPolicyVersion,
                     "REVOKED".equals(decision.decision()) ? revocationId : null,
                     "REVOKED".equals(decision.decision()) ? "NO_DERIVED_DATA" : null);
             if ("PRIVATE_COLLECTION".equals(decision.purpose())) {

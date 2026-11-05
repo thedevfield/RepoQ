@@ -5,7 +5,6 @@ import dev.devfield.repoq.project.data.Projects;
 import dev.devfield.repoq.project.security.AuthSessionVerifier;
 import java.util.UUID;
 import java.util.List;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -31,13 +30,9 @@ public class GitHubConnectionsController {
     private final AuthSessionVerifier sessions;
     private final GitHubConnections connections;
     private final Projects projects;
-    private final String policyVersion;
-
     public GitHubConnectionsController(AuthSessionVerifier sessions, GitHubConnections connections,
-            Projects projects,
-            @Value("${devfield.project.github.private-consent-policy-version:}") String policyVersion) {
+            Projects projects) {
         this.sessions = sessions; this.connections = connections; this.projects = projects;
-        this.policyVersion = policyVersion;
     }
 
     @PostMapping("/connections/start")
@@ -81,9 +76,8 @@ public class GitHubConnectionsController {
             @RequestHeader("Authorization") String bearer, @AuthenticationPrincipal Jwt jwt,
             @PathVariable String githubRepositoryId, @RequestBody ConsentRequest input) {
         sessions.verify(bearer);
-        if (policyVersion.isBlank() || input == null || input.consents() == null || input.consents().size() != 2 ||
-                input.consents().stream().anyMatch(c -> c == null || c.policyVersion() == null ||
-                        !policyVersion.equals(c.policyVersion()))) throw invalid();
+        if (input == null || input.consents() == null || input.consents().stream().anyMatch(c -> c == null))
+            throw invalid();
         var result = projects.changeConsents(user(jwt), githubRepositoryId,
                 input.consents().stream().map(c -> new Projects.Consent(
                         c.purpose(), c.decision(), c.policyVersion())).toList());

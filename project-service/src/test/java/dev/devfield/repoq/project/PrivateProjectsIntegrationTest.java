@@ -31,6 +31,8 @@ import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import org.springframework.test.util.AopTestUtils;
+import org.springframework.test.util.ReflectionTestUtils;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestPropertySource(properties = {
@@ -72,6 +74,7 @@ class PrivateProjectsIntegrationTest {
         assertEquals(2, json.readTree(empty.body()).path("consents").size());
         assertTrue(json.readTree(empty.body()).path("consents").get(0).path("decision").isNull());
         assertTrue(json.readTree(empty.body()).path("consents").get(1).path("policyVersion").isNull());
+        assertTrue(json.readTree(empty.body()).path("consents").get(0).path("cleanupState").isNull());
         assertFalse(empty.body().contains("org/private"));
         when(connections.requirePrivateRepository(other, "72")).thenThrow(
                 new ApiProblem(HttpStatus.FORBIDDEN, "github_access_denied"));
@@ -114,13 +117,13 @@ class PrivateProjectsIntegrationTest {
         assertEquals(404, call("GET", "/api/github/repositories/72/consents", "other", null, null).statusCode());
         var jwt = new Jwt("owner", Instant.now().minusSeconds(10), Instant.now().plusSeconds(300),
                 Map.of("alg", "RS256"), Map.of("sub", owner.toString()));
-        var unset = new GitHubConnectionsController(sessions, connections, new Projects(db, connections, ""), "");
+        var unset = new GitHubConnectionsController(sessions, connections, new Projects(db, connections, ""));
         assertNull(unset.consentStatus("Bearer owner", jwt, "72").currentPolicyVersion());
         assertFalse(unset.consentStatus("Bearer owner", jwt, "72").consentSubmissionAvailable());
         assertEquals("invalid_request", assertThrows(ApiProblem.class,
                 () -> unset.consents("Bearer owner", jwt, "72",
                         new GitHubConnectionsController.ConsentRequest(List.of(
-                                new GitHubConnectionsController.ConsentInput("PRIVATE_COLLECTION", "GRANTED", "test-v1"),
+                                new GitHubConnectionsController.ConsentInput("PRIVATE_COLLECTION", "GRANTED", "test-v2"),
                                 new GitHubConnectionsController.ConsentInput("EXTERNAL_AI", "DENIED", "test-v1"))))).code());
     }
 
@@ -148,7 +151,101 @@ class PrivateProjectsIntegrationTest {
                 Integer.class, owner));
         db.update("UPDATE project.repository_consent SET cleanup_state='PENDING' " +
                 "WHERE owner_user_id=? AND purpose='PRIVATE_COLLECTION' AND decision='REVOKED'", owner);
+        var pending = json.readTree(call("GET", path, "owner", null, null).body());
+        assertEquals("PENDING", pending.path("consents").get(0).path("cleanupState").asText());
         assertEquals(409, call("PUT", path, "owner", granted, null).statusCode());
+    }
+
+    @Test
+    void noPolicyStillAllowsOwnedRevocationUsingRecordedVersion() throws Exception {
+        prepare();
+        var created = call("POST", "/api/projects", "owner", "{\"repositories\":[" + PRIVATE + "]}", null);
+        assertEquals(201, created.statusCode(), created.body());
+        UUID project = UUID.fromString(json.readTree(created.body()).path("id").asText());
+        db.update("UPDATE project.repository_consent SET policy_version='test-v0' " +
+                "WHERE owner_user_id=? AND purpose='PRIVATE_COLLECTION'", owner);
+        when(connections.requirePrivateRepository(owner, "72")).thenThrow(
+                new ApiProblem(HttpStatus.FORBIDDEN, "github_access_denied"));
+        Object target = AopTestUtils.getTargetObject(projects);
+        ReflectionTestUtils.setField(target, "policyVersion", "");
+        String path = "/api/github/repositories/72/consents";
+        String revoke = "{\"consents\":[{\"purpose\":\"PRIVATE_COLLECTION\",\"decision\":\"REVOKED\",\"policyVersion\":\"untrusted\"}]}";
+        try {
+            var first = call("PUT", path, "owner", revoke, null);
+            assertEquals(202, first.statusCode(), first.body());
+            var repeat = call("PUT", path, "owner", revoke, null);
+            assertEquals(202, repeat.statusCode());
+            assertEquals(json.readTree(first.body()).path("revocationId"), json.readTree(repeat.body()).path("revocationId"));
+            String legacy = "{\"consents\":[" +
+                    "{\"purpose\":\"PRIVATE_COLLECTION\",\"decision\":\"REVOKED\",\"policyVersion\":\"test-v1\"}," +
+                    "{\"purpose\":\"EXTERNAL_AI\",\"decision\":\"DENIED\",\"policyVersion\":\"test-v1\"}]}";
+            var legacyRepeat = call("PUT", path, "owner", legacy, null);
+            assertEquals(202, legacyRepeat.statusCode());
+            assertEquals(json.readTree(first.body()).path("revocationId"),
+                    json.readTree(legacyRepeat.body()).path("revocationId"));
+            var status = json.readTree(call("GET", path, "owner", null, null).body());
+            assertTrue(status.path("currentPolicyVersion").isNull());
+            assertFalse(status.path("consentSubmissionAvailable").asBoolean());
+            assertEquals("test-v0", status.path("consents").get(0).path("policyVersion").asText());
+            assertEquals("NO_DERIVED_DATA", status.path("consents").get(0).path("cleanupState").asText());
+            assertEquals("DENIED", status.path("consents").get(1).path("decision").asText());
+            assertEquals(2L, db.queryForObject("SELECT membership_version FROM project.registered_project WHERE id=?",
+                    Long.class, project));
+            assertEquals("BLOCKED", db.queryForObject("SELECT access_state FROM project.project_repository WHERE owner_user_id=?",
+                    String.class, owner));
+            assertEquals("CANCELLED", db.queryForObject("SELECT state FROM project.analysis_job WHERE project_id=?",
+                    String.class, project));
+            assertEquals(3, db.queryForObject("SELECT count(*) FROM project.repository_consent WHERE owner_user_id=?",
+                    Integer.class, owner));
+            String grant = revoke.replace("REVOKED", "GRANTED").replace("untrusted", "test-v0");
+            assertEquals(400, call("PUT", path, "owner", grant, null).statusCode());
+        } finally {
+            ReflectionTestUtils.setField(target, "policyVersion", "test-v1");
+        }
+        String grant = "{\"consents\":[" +
+                "{\"purpose\":\"PRIVATE_COLLECTION\",\"decision\":\"GRANTED\",\"policyVersion\":\"test-v1\"}," +
+                "{\"purpose\":\"EXTERNAL_AI\",\"decision\":\"DENIED\",\"policyVersion\":\"test-v1\"}]}";
+        assertEquals(400, call("PUT", path, "owner", grant.replace("test-v1", "test-v0"), null).statusCode());
+        assertEquals(403, call("PUT", path, "owner", grant, null).statusCode());
+        doReturn(UUID.randomUUID()).when(connections).requirePrivateRepository(owner, "72");
+        assertEquals(403, call("PUT", path, "owner", grant, null).statusCode());
+        doReturn(connectionId).when(connections).requirePrivateRepository(owner, "72");
+        assertEquals(200, call("PUT", path, "owner", grant, null).statusCode());
+        assertEquals(3L, db.queryForObject("SELECT membership_version FROM project.registered_project WHERE id=?",
+                Long.class, project));
+        assertEquals("ACTIVE", db.queryForObject("SELECT access_state FROM project.project_repository WHERE owner_user_id=?",
+                String.class, owner));
+        assertEquals("QUEUED", db.queryForObject("SELECT state FROM project.analysis_job WHERE project_id=? " +
+                "ORDER BY created_at DESC,id DESC LIMIT 1", String.class, project));
+    }
+
+    @Test
+    void partialExternalAiRevocationPreservesCollectionWithoutGitHubRecheck() throws Exception {
+        prepare();
+        String path = "/api/github/repositories/72/consents";
+        String granted = "{\"consents\":[" +
+                "{\"purpose\":\"PRIVATE_COLLECTION\",\"decision\":\"GRANTED\",\"policyVersion\":\"test-v1\"}," +
+                "{\"purpose\":\"EXTERNAL_AI\",\"decision\":\"GRANTED\",\"policyVersion\":\"test-v1\"}]}";
+        assertEquals(200, call("PUT", path, "owner", granted, null).statusCode());
+        when(connections.requirePrivateRepository(owner, "72")).thenThrow(
+                new ApiProblem(HttpStatus.FORBIDDEN, "github_access_denied"));
+        String aiRevoke = "{\"consents\":[{\"purpose\":\"EXTERNAL_AI\",\"decision\":\"REVOKED\",\"policyVersion\":null}]}";
+        var first = call("PUT", path, "owner", aiRevoke, null);
+        assertEquals(202, first.statusCode(), first.body());
+        assertEquals(202, call("PUT", path, "owner", granted.replace(
+                "\"purpose\":\"EXTERNAL_AI\",\"decision\":\"GRANTED\"",
+                "\"purpose\":\"EXTERNAL_AI\",\"decision\":\"REVOKED\""), null).statusCode());
+        var status = json.readTree(call("GET", path, "owner", null, null).body());
+        assertEquals("GRANTED", status.path("consents").get(0).path("decision").asText());
+        assertEquals("REVOKED", status.path("consents").get(1).path("decision").asText());
+        assertEquals("NO_DERIVED_DATA", status.path("consents").get(1).path("cleanupState").asText());
+        assertEquals(3, db.queryForObject("SELECT count(*) FROM project.repository_consent WHERE owner_user_id=?",
+                Integer.class, owner));
+        assertEquals(400, call("PUT", path, "owner", "{\"consents\":[" +
+                "{\"purpose\":\"PRIVATE_COLLECTION\",\"decision\":\"GRANTED\",\"policyVersion\":\"test-v1\"}]}" , null).statusCode());
+        assertEquals(400, call("PUT", path, "owner", "{\"consents\":null}", null).statusCode());
+        assertEquals(400, call("PUT", path, "owner", "{\"consents\":[null]}", null).statusCode());
+        assertEquals(403, call("PUT", path, "other", aiRevoke, null).statusCode());
     }
 
     @Test

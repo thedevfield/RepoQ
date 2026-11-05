@@ -69,10 +69,12 @@ result. Actual GitHub browser E2E must run after the BFF is implemented.
 DevField JWT/JWKS and AUTH-15 session check as P-12. The ID must be a positive
 decimal GitHub repository ID. The response contains only the ID, the configured
 `PROJECT_PRIVATE_CONSENT_POLICY_VERSION` (or `null` when unset),
-`consentSubmissionAvailable`, and the latest `decision` and `policyVersion` for
-each of `PRIVATE_COLLECTION` and `EXTERNAL_AI`. An absent decision has both
-values `null`. `consentSubmissionAvailable: false` means the server cannot
-accept a new consent; the BFF must not present submission as available. A
+`consentSubmissionAvailable`, and the latest `decision`, `policyVersion`, and
+`cleanupState` for each of `PRIVATE_COLLECTION` and `EXTERNAL_AI`. An absent
+decision has all three values `null`; ordinary `GRANTED` and `DENIED` have a
+null `cleanupState`. `REVOKED` returns the stored cleanup state.
+`consentSubmissionAvailable: false` means the server cannot accept a new
+`GRANTED` or `DENIED`; the BFF must still permit an owned revocation. A
 previous `GRANTED` remains labeled with its original policy version and does
 not become a grant for the current version.
 
@@ -84,3 +86,25 @@ The response never contains repository names, paths, tokens, or code. This API
 does not establish a legally approved policy text; that text requires separate
 approval. P-12 records a new event when the decision is repeated under a new
 server supported policy version, while an exact repeat adds no event.
+
+## P-12 revocation and reconsent
+
+`PUT /api/github/repositories/{githubRepositoryId}/consents` keeps the existing
+two-purpose request and `{revocationId,status}` response. It additionally
+accepts a single-purpose request only when its decision is `REVOKED`. The
+other purpose is untouched. For `REVOKED`, `policyVersion` may be `null` or an
+older client-supplied string; Project Service ignores it and records the latest
+owned event's policy version. It requires an existing `GRANTED` or `REVOKED`
+for that purpose, but neither a configured current policy version nor current
+GitHub access. A repeated revocation returns the existing `revocationId`.
+Unchanged entries in a two-purpose request are left untouched, including when
+GitHub access or the current policy version has changed.
+
+New `GRANTED` and `DENIED` events require the configured policy version in the
+request. `GRANTED` additionally requires current user and App repository
+access. A previous `REVOKED` with `cleanupState: NO_DERIVED_DATA` allows the
+user to *start* a new explicit grant; it does not establish GitHub access or a
+current-policy grant by itself. Unknown or unfinished cleanup states block
+reconsent. A Private collection revocation immediately blocks matching
+Project members and cancels active DB jobs in the same transaction. The
+current stage has no Worker, Snapshot, or Interview cleanup to report as done.
