@@ -12,6 +12,7 @@ import org.springframework.transaction.annotation.Transactional;
 public class AnalysisJobs {
     public record Execution(UUID jobId, UUID projectId, long membershipVersion, int attempt) {}
     public record Progress(UUID repositoryId, String state, String commitSha, String failureCode) {}
+    public record Target(UUID repositoryId, String githubRepositoryId, String commitSha) {}
     record Member(UUID id, String githubId, String visibility, String accessState) {}
     record Locked(UUID id, UUID projectId, long version, long currentVersion, String state,
                   int attempt, boolean leaseValid, boolean due, String analysisVersion,
@@ -22,6 +23,13 @@ public class AnalysisJobs {
     private final ObjectMapper json = new ObjectMapper();
 
     public AnalysisJobs(JdbcTemplate db, AnalysisSettings settings) { this.db = db; this.settings = settings; }
+
+    @Transactional
+    public List<Target> targets(Execution execution) {
+        Locked job = current(execution);
+        return job.members().stream().map(m -> new Target(m.id(), m.githubId(), job.progress().stream()
+                .filter(p -> p.repositoryId().equals(m.id())).findFirst().orElseThrow().commitSha())).toList();
+    }
 
     public List<UUID> queued(int limit) {
         checkLimit(limit);

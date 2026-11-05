@@ -20,7 +20,16 @@ public class AnalysisSnapshots {
                            List<UUID> evidenceIds, String summary) {
         public Relation { evidenceIds = List.copyOf(evidenceIds); }
     }
-    public record Coverage(UUID memberId, int collectedFiles, int skippedFiles) {}
+    public record Coverage(UUID memberId, int collectedFiles, int skippedFiles,
+                           List<String> selectedPaths, Map<String, Integer> exclusions) {
+        public Coverage {
+            selectedPaths = selectedPaths == null ? List.of() : List.copyOf(selectedPaths);
+            exclusions = exclusions == null ? Map.of() : Map.copyOf(exclusions);
+        }
+        public Coverage(UUID memberId, int collectedFiles, int skippedFiles) {
+            this(memberId, collectedFiles, skippedFiles, List.of(), Map.of());
+        }
+    }
     public record Draft(List<Member> members, List<Evidence> evidence, List<Topic> topics,
                         List<Role> roles, List<Relation> relations, List<Coverage> coverage) {
         public Draft {
@@ -43,13 +52,14 @@ public class AnalysisSnapshots {
         if (TransactionSynchronizationManager.isActualTransactionActive())
             throw new IllegalStateException("Public access verification must run outside a transaction");
         validate(draft);
-        // No production verifier exists in A-stage: DB visibility or a caller-supplied flag is never approval.
         PublicAccessVerifier verifier = publicAccess.orElseThrow(() -> new IllegalStateException("Public access verifier unavailable"));
         var sources = draft.members().stream().map(m -> new PublicAccessVerifier.Source(
                 m.repositoryId(), m.githubRepositoryId(), m.commitSha())).toList();
-        if (!verifier.verify(sources)) throw new IllegalStateException("Public access not verified");
+        var proof = verifier.verify(sources);
+        if (proof == null || !proof.validFor(sources)) throw new IllegalStateException("Public access not verified");
         return tx.execute(status -> {
             AnalysisJobs.Locked job = jobs.current(execution);
+            if (!proof.validFor(sources)) throw new IllegalStateException("Public access verification expired");
             if (job.members().size() != draft.members().size()) throw invalid();
             for (Member member : draft.members()) {
                 if (job.members().stream().noneMatch(m -> m.id().equals(member.repositoryId()) && m.githubId().equals(member.githubRepositoryId())) ||
@@ -82,6 +92,7 @@ public class AnalysisSnapshots {
                     UUID.randomUUID(), snapshot, t.key(), t.active(), t.evidenceId());
             // Recheck the lease after inserts as well: a slow publication must not outlive its execution.
             jobs.current(execution);
+            if (!proof.validFor(sources)) throw new IllegalStateException("Public access verification expired");
             db.update("UPDATE project.registered_project SET latest_ready_snapshot_id=?,updated_at=clock_timestamp() WHERE id=?",
                     snapshot, job.projectId());
             jobs.writeCurrent(execution, "state='READY',finished_at=clock_timestamp(),lease_expires_at=NULL,failure_code=NULL");
@@ -131,7 +142,9 @@ public class AnalysisSnapshots {
         Set<UUID> covered = new HashSet<>();
         for (Coverage c : d.coverage()) {
             if (!members.containsKey(c.memberId()) || !covered.add(c.memberId()) || c.collectedFiles() < 0 ||
-                    c.collectedFiles() > 40 || c.skippedFiles() < 0) throw invalid();
+                    c.collectedFiles() > 40 || c.skippedFiles() < 0 || c.selectedPaths().size() > 40 ||
+                    c.selectedPaths().stream().anyMatch(p -> !validPath(p)) || c.exclusions().size() > 32 ||
+                    c.exclusions().entrySet().stream().anyMatch(e -> !e.getKey().matches("[a-z_]{1,40}") || e.getValue() < 0)) throw invalid();
         }
         if (!covered.equals(members.keySet()) || d.coverage().stream().mapToInt(Coverage::collectedFiles).sum() > 40) throw invalid();
     }

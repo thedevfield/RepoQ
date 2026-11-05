@@ -277,10 +277,10 @@ class AnalysisIntegrationTest {
     void tc19NoAutomaticExecutionOrProductionVerifier() {
         Fixture f = fixture(1);
         assertFalse(settings.enabled()); assertEquals("QUEUED", state(f));
-        assertThrows(IllegalStateException.class, () -> new AnalysisSettings(true, 3, 60, 300));
+        assertTrue(new AnalysisSettings(true, 3, 60, 300).enabled());
         var run = jobs.claim(f.job()); Draft d = ready(f, run);
         assertThrows(IllegalStateException.class, () -> productionSnapshots.publish(run, d));
-        var denied = new AnalysisSnapshots(db, jobs, tx, Optional.of(sources -> false));
+        var denied = new AnalysisSnapshots(db, jobs, tx, Optional.of(sources -> null));
         assertThrows(IllegalStateException.class, () -> denied.publish(run, d));
         assertThrows(IllegalStateException.class, () -> tx.execute(s -> verified().publish(run, d)));
         assertEquals(0, snapshots(f));
@@ -292,7 +292,7 @@ class AnalysisIntegrationTest {
         var verifier = new AnalysisSnapshots(db, jobs, tx, Optional.of(sources -> {
             assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
             db.update("UPDATE project.analysis_job SET state='CANCELLED' WHERE id=?", f.job());
-            return true;
+            return new PublicAccessVerifier.Proof(Set.copyOf(sources), java.time.Instant.now());
         }));
         assertThrows(IllegalStateException.class, () -> verifier.publish(run, d)); assertEquals(0, snapshots(f));
     }
@@ -363,7 +363,7 @@ class AnalysisIntegrationTest {
 
     private AnalysisSnapshots verified() {
         return new AnalysisSnapshots(db, jobs, tx, Optional.of(sources -> {
-            assertFalse(TransactionSynchronizationManager.isActualTransactionActive()); return true;
+            assertFalse(TransactionSynchronizationManager.isActualTransactionActive()); return new PublicAccessVerifier.Proof(Set.copyOf(sources), java.time.Instant.now());
         }));
     }
     private Fixture fixture(int count) {

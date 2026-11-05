@@ -179,7 +179,7 @@ public class Projects {
             throw new ApiProblem(HttpStatus.BAD_REQUEST, "invalid_repositories");
         boolean blocked = privateMembers(owner, projectId).stream().anyMatch(m -> !accessible(owner, m));
         if (hasRunningJob(projectId)) throw conflict("analysis_in_progress");
-        // A-stage QUEUED jobs have no worker. Replace one atomically so adding to a new project works.
+        // Replace a queued job under the same fences used by the worker's claim.
         cancelQueuedJob(projectId);
         try {
             insertMembers(projectId, owner, repositories);
@@ -210,7 +210,7 @@ public class Projects {
         int count = db.queryForObject("SELECT count(*) FROM project.project_repository " +
                 "WHERE project_id=? AND removed_at IS NULL", Integer.class, projectId);
         if (count <= 1) throw conflict("last_repository_required");
-        // A-stage has no worker cancellation handshake; refuse removal while one is running.
+        // Public membership changes retain the RUNNING conflict policy; private revocation can cancel.
         if (hasRunningJob(projectId) && !removingPrivate) throw conflict("analysis_in_progress");
         if (removingPrivate) cancelActiveJobs(projectId); else cancelQueuedJob(projectId);
         db.update("UPDATE project.project_repository SET removed_at=now() WHERE id=?", memberId);

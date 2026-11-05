@@ -1,0 +1,93 @@
+package dev.devfield.repoq.project.analysis;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sun.net.httpserver.HttpServer;
+import dev.devfield.repoq.project.github.GitHubSourceClient;
+import java.net.*;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+
+final class MockSourceServer implements AutoCloseable {
+    static final String SHA = "a".repeat(40), TREE = "b".repeat(40);
+    static final String JAVA = """
+            import org.springframework.web.bind.annotation.RestController;
+            import org.springframework.transaction.annotation.Transactional;
+            @RestController
+            public class App {
+                @Transactional public String get() { return "safe"; }
+            }
+            """;
+    static final class Repo {
+        final String id;
+        String name, returnedId, head = SHA;
+        boolean privateRepo, truncated, badBlobSha, badCommitSha;
+        int status;
+        String mode = "100644";
+        final Map<String, String> files = new LinkedHashMap<>();
+        Repo(String id) { this.id = id; this.returnedId = id; this.name = "owner/repo" + id; files.put("src/App.java", JAVA); }
+    }
+    final Map<String, Repo> repos = new ConcurrentHashMap<>();
+    final List<String> paths = Collections.synchronizedList(new ArrayList<>());
+    final AtomicInteger contentRequests = new AtomicInteger(), authorizationHeaders = new AtomicInteger();
+    final Map<String, String> headers = new ConcurrentHashMap<>();
+    volatile Runnable beforeBlob = () -> {};
+    volatile int allStatus;
+    volatile String rawResponse;
+    final HttpServer server;
+    private final ObjectMapper json = new ObjectMapper();
+    MockSourceServer() throws Exception {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            try {
+                String path = exchange.getRequestURI().getPath(); paths.add(path);
+                if (exchange.getRequestHeaders().containsKey("Authorization")) authorizationHeaders.incrementAndGet();
+                Object body = Map.of("message", "SENSITIVE_RESPONSE"); int status = allStatus;
+                Repo repo = null;
+                if (path.startsWith("/repositories/")) repo = repos.get(path.substring("/repositories/".length()));
+                else for (Repo value : repos.values()) if (path.startsWith("/repos/" + value.name + "/")) { repo = value; break; }
+                if (status == 0) {
+                    if (repo == null) status = 404;
+                    else if (repo.status != 0) status = repo.status;
+                    else if (path.startsWith("/repositories/")) {
+                        status = 200; body = Map.of("id", Long.parseLong(repo.returnedId), "private", repo.privateRepo,
+                                "visibility", repo.privateRepo ? "private" : "public", "full_name", repo.name, "default_branch", "main");
+                    } else if (path.contains("/git/ref/heads/")) {
+                        status = 200; body = Map.of("object", Map.of("type", "commit", "sha", repo.head));
+                    } else if (path.contains("/git/commits/")) {
+                        status = 200; body = Map.of("sha", repo.badCommitSha ? "c".repeat(40) : path.substring(path.lastIndexOf('/') + 1), "tree", Map.of("sha", TREE));
+                    } else if (path.contains("/git/trees/")) {
+                        List<Map<String, Object>> entries = new ArrayList<>();
+                        for (var file : repo.files.entrySet()) {
+                            byte[] data = file.getValue().getBytes(StandardCharsets.UTF_8);
+                            entries.add(Map.of("path", file.getKey(), "type", "blob", "mode", repo.mode, "size", data.length, "sha", GitHubSourceClient.blobSha(data)));
+                        }
+                        status = 200; body = Map.of("sha", TREE, "truncated", repo.truncated, "tree", entries);
+                    } else if (path.contains("/git/blobs/")) {
+                        contentRequests.incrementAndGet(); beforeBlob.run();
+                        if (repo.privateRepo) status = 404;
+                        else {
+                            String sha = path.substring(path.lastIndexOf('/') + 1);
+                            for (String text : repo.files.values()) {
+                                byte[] data = text.getBytes(StandardCharsets.UTF_8);
+                                if (GitHubSourceClient.blobSha(data).equals(sha)) {
+                                    status = 200; body = Map.of("sha", repo.badBlobSha ? "d".repeat(40) : sha, "size", data.length,
+                                            "encoding", "base64", "content", Base64.getEncoder().encodeToString(data)); break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (status == 0) status = 404;
+                byte[] bytes = rawResponse == null ? json.writeValueAsBytes(body) : rawResponse.getBytes(StandardCharsets.UTF_8);
+                headers.forEach((key, value) -> exchange.getResponseHeaders().set(key, value));
+                exchange.sendResponseHeaders(status, bytes.length); exchange.getResponseBody().write(bytes);
+            } finally { exchange.close(); }
+        });
+        server.start();
+    }
+    Repo add(String id) { Repo repo = new Repo(id); repos.put(id, repo); return repo; }
+    GitHubSourceClient client() { return new GitHubSourceClient(URI.create("http://127.0.0.1:" + server.getAddress().getPort())); }
+    @Override public void close() { server.stop(0); }
+}
