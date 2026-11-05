@@ -90,6 +90,13 @@ public class GitHubConnectionsController {
         return ResponseEntity.status(result.revocationId() == null ? HttpStatus.OK : HttpStatus.ACCEPTED).body(result);
     }
 
+    @GetMapping("/repositories/{githubRepositoryId}/consents")
+    public Projects.ConsentStatus consentStatus(@RequestHeader("Authorization") String bearer,
+            @AuthenticationPrincipal Jwt jwt, @PathVariable String githubRepositoryId) {
+        sessions.verify(bearer);
+        return projects.consentStatus(user(jwt), githubRepositoryId);
+    }
+
     @DeleteMapping("/connections/{connectionId}")
     public ResponseEntity<Projects.Disconnection> disconnect(
             @RequestHeader("Authorization") String bearer, @AuthenticationPrincipal Jwt jwt,
