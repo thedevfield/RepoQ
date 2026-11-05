@@ -278,6 +278,79 @@ class PrivateProjectsIntegrationTest {
         db.update("DELETE FROM project.github_connection WHERE devfield_user_id=?", owner);
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void concurrentRevocationWinsAfterRegistrationAndReplayStaysRedacted(boolean addition) throws Exception {
+        prepare();
+        String path = "/api/projects";
+        if (addition) {
+            var created = call("POST", path, "owner", "{\"repositoryUrl\":\"https://github.com/owner/repo\"}", null);
+            path += "/" + json.readTree(created.body()).path("id").asText() + "/repositories";
+        }
+        String target = path;
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        doAnswer(invocation -> {
+            entered.countDown();
+            if (!release.await(10, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("timeout");
+            return connectionId;
+        }).when(connections).requirePrivateRepository(owner, "72");
+        String body = "{\"repositories\":[" + PRIVATE + "]}";
+        try (var pool = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            var registering = pool.submit(() -> call("POST", target, "owner", body, "race-create"));
+            assertTrue(entered.await(10, java.util.concurrent.TimeUnit.SECONDS));
+            var revoking = pool.submit(() -> call("PUT", "/api/github/repositories/72/consents", "owner",
+                    "{\"consents\":[{\"purpose\":\"PRIVATE_COLLECTION\",\"decision\":\"REVOKED\",\"policyVersion\":null}]}", null));
+            release.countDown();
+            assertEquals(201, registering.get().statusCode());
+            assertEquals(202, revoking.get().statusCode());
+        } finally { release.countDown(); }
+        var replay = call("POST", target, "owner", body, "race-create");
+        assertEquals(201, replay.statusCode());
+        assertFalse(replay.body().contains("org/private"));
+        assertEquals("BLOCKED", db.queryForObject("SELECT access_state FROM project.project_repository WHERE owner_user_id=? AND visibility='PRIVATE'", String.class, owner));
+        assertEquals("REVOKED", db.queryForObject("SELECT decision FROM project.repository_consent WHERE owner_user_id=? " +
+                "AND purpose='PRIVATE_COLLECTION' ORDER BY event_order DESC LIMIT 1", String.class, owner));
+        assertEquals(3, db.queryForObject("SELECT count(*) FROM project.repository_consent WHERE owner_user_id=?", Integer.class, owner));
+    }
+
+    @Test
+    void inlineConsentsCannotHidePendingRevocationAndRollbackMixedWrites() throws Exception {
+        prepare();
+        var publicProject = call("POST", "/api/projects", "owner",
+                "{\"repositoryUrl\":\"https://github.com/owner/repo\"}", null);
+        UUID project = UUID.fromString(json.readTree(publicProject.body()).path("id").asText());
+        when(publicGithub.fetch("owner", "second")).thenReturn(
+                new GitHubRepositoryClient.Repository("124", "owner/second", "second"));
+        for (String purpose : List.of("PRIVATE_COLLECTION", "EXTERNAL_AI")) {
+            UUID event = UUID.randomUUID();
+            db.update("INSERT INTO project.repository_consent(id,owner_user_id,github_repository_id,purpose,decision,policy_version,revocation_id,cleanup_state) " +
+                    "VALUES (?,?,'72',?,'REVOKED','test-v0',?,'PENDING')", event, owner, purpose, UUID.randomUUID());
+            for (String privateInput : List.of(PRIVATE, PRIVATE.replace("DENIED", "GRANTED"))) {
+                String body = "{\"repositories\":[{\"repositoryUrl\":\"https://github.com/owner/second\"}," + privateInput + "]}";
+                for (String path : List.of("/api/projects", "/api/projects/" + project + "/repositories")) {
+                    var result = call("POST", path, "owner", body, UUID.randomUUID().toString());
+                    assertEquals(409, result.statusCode(), result.body());
+                    assertEquals("revocation_in_progress", json.readTree(result.body()).path("code").asText());
+                    assertEquals(1, db.queryForObject("SELECT count(*) FROM project.repository_consent WHERE owner_user_id=?", Integer.class, owner));
+                    assertEquals(1, db.queryForObject("SELECT count(*) FROM project.project_repository WHERE owner_user_id=?", Integer.class, owner));
+                    assertEquals(1, db.queryForObject("SELECT count(*) FROM project.registered_project WHERE owner_user_id=?", Integer.class, owner));
+                    assertEquals(1L, db.queryForObject("SELECT membership_version FROM project.registered_project WHERE id=?", Long.class, project));
+                    assertEquals("QUEUED", db.queryForObject("SELECT state FROM project.analysis_job WHERE project_id=?", String.class, project));
+                    assertEquals("PENDING", db.queryForObject("SELECT cleanup_state FROM project.repository_consent WHERE id=?", String.class, event));
+                }
+            }
+            db.update("DELETE FROM project.repository_consent WHERE id=?", event);
+        }
+        db.update("INSERT INTO project.repository_consent(id,owner_user_id,github_repository_id,purpose,decision,policy_version,revocation_id,cleanup_state) " +
+                "VALUES (?,?,'72','PRIVATE_COLLECTION','REVOKED','test-v0',?,'NO_DERIVED_DATA')", UUID.randomUUID(), owner, UUID.randomUUID());
+        assertEquals(201, call("POST", "/api/projects/" + project + "/repositories", "owner",
+                "{\"repositories\":[" + PRIVATE + "]}", "reconsent").statusCode());
+        assertEquals("GRANTED", db.queryForObject("SELECT decision FROM project.repository_consent WHERE owner_user_id=? " +
+                "AND purpose='PRIVATE_COLLECTION' ORDER BY event_order DESC LIMIT 1", String.class, owner));
+        assertEquals(2L, db.queryForObject("SELECT membership_version FROM project.registered_project WHERE id=?", Long.class, project));
+    }
+
     private void prepare() {
         when(decoder.decode(anyString())).thenAnswer(call -> {
             String token = call.getArgument(0);

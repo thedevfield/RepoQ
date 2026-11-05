@@ -316,17 +316,14 @@ public class Projects {
                     continue;
                 if (policyVersion.isBlank() || !policyVersion.equals(eventPolicyVersion))
                     throw new ApiProblem(HttpStatus.BAD_REQUEST, "invalid_request");
+                requireConsentTransition(old, latest == null ? null : (String) latest[2], decision.decision());
                 if ("GRANTED".equals(decision.decision())) {
-                    if ("REVOKED".equals(old) && !"NO_DERIVED_DATA".equals(latest[2]))
-                        throw conflict("revocation_in_progress");
                     UUID connectionId = connections.requirePrivateRepository(owner, repositoryId);
                     if (Boolean.TRUE.equals(db.queryForObject("SELECT EXISTS(SELECT 1 FROM project.project_repository " +
                             "WHERE owner_user_id=? AND github_repository_id=? AND visibility='PRIVATE' " +
                             "AND removed_at IS NULL AND github_connection_id<>?)", Boolean.class,
                             owner, repositoryId, connectionId)))
                         throw new ApiProblem(HttpStatus.FORBIDDEN, "private_access_unavailable");
-                } else if ("GRANTED".equals(old) || "REVOKED".equals(old)) {
-                    throw conflict("revocation_required");
                 }
             }
             db.update("INSERT INTO project.repository_consent" +
@@ -478,6 +475,14 @@ public class Projects {
     private void insertMembers(UUID projectId, UUID owner, List<Repository> repositories) {
         for (var repository : repositories) {
             var identity = repository.identity();
+            for (Consent consent : repository.consents()) {
+                var prior = db.query("SELECT decision,cleanup_state FROM project.repository_consent " +
+                                "WHERE owner_user_id=? AND github_repository_id=? AND purpose=? " +
+                                "ORDER BY event_order DESC LIMIT 1",
+                        (rs, n) -> new String[]{rs.getString(1), rs.getString(2)}, owner, identity.id(), consent.purpose());
+                if (!prior.isEmpty())
+                    requireConsentTransition(prior.getFirst()[0], prior.getFirst()[1], consent.decision());
+            }
             if (repository.connectionId() != null &&
                     !repository.connectionId().equals(connections.requirePrivateRepository(owner, identity.id())))
                 throw new ApiProblem(HttpStatus.FORBIDDEN, "private_access_unavailable");
@@ -491,6 +496,13 @@ public class Projects {
                                 "(id,owner_user_id,github_repository_id,purpose,decision,policy_version) VALUES (?,?,?,?,?,?)",
                         UUID.randomUUID(), owner, identity.id(), consent.purpose(), consent.decision(), consent.policyVersion());
         }
+    }
+
+    private static void requireConsentTransition(String previous, String cleanup, String decision) {
+        if ("REVOKED".equals(previous) && !"NO_DERIVED_DATA".equals(cleanup))
+            throw conflict("revocation_in_progress");
+        if ("DENIED".equals(decision) && ("GRANTED".equals(previous) || "REVOKED".equals(previous)))
+            throw conflict("revocation_required");
     }
 
     private List<Member> privateMembers(UUID owner, UUID projectId) {
