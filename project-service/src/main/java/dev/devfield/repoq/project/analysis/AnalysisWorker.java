@@ -1,6 +1,7 @@
 package dev.devfield.repoq.project.analysis;
 
 import dev.devfield.repoq.project.github.GitHubSourceClient;
+import dev.devfield.repoq.project.analysis.AnalysisJobs.Target;
 import dev.devfield.repoq.project.github.GitHubSourceClient.*;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -43,6 +44,7 @@ public class AnalysisWorker {
         try {
             executor.execute(() -> {
                 try {
+                    snapshots.cleanupCheckpoints();
                     for (UUID expired : jobs.expired(20)) {
                         try { jobs.recover(expired); } catch (RuntimeException e) { log.debug("Analysis recovery deferred"); }
                     }
@@ -61,36 +63,77 @@ public class AnalysisWorker {
         UUID activeRepository = null;
         try {
             var targets = jobs.targets(execution);
-            Budget budget = new Budget(140, () -> jobs.heartbeat(execution));
+            Budget budget = new Budget(settings.maxRequests(), () -> jobs.heartbeat(execution));
+            Set<UUID> completed = snapshots.completed(execution);
+            List<Target> pending = targets.stream().filter(t -> !completed.contains(t.repositoryId())).toList();
+            List<Target> batch = client.batch(pending, budget);
             List<Plan> plans = new ArrayList<>();
-            for (int i = 0; i < targets.size(); i++) {
-                var target = targets.get(i); activeRepository = target.repositoryId();
-                int files = GitHubSourceClient.MAX_FILES / targets.size() + (i < GitHubSourceClient.MAX_FILES % targets.size() ? 1 : 0);
-                int bytes = GitHubSourceClient.TOTAL_BYTES / targets.size();
-                plans.add(client.prepare(target, files, bytes, budget, sha -> jobs.progress(execution,
-                        new AnalysisJobs.Progress(target.repositoryId(), "RUNNING", sha, null))));
+            for (Target target : batch) {
+                activeRepository = target.repositoryId();
+                int index = targets.indexOf(target);
+                int files = GitHubSourceClient.MAX_FILES / targets.size() + (index < GitHubSourceClient.MAX_FILES % targets.size() ? 1 : 0);
+                plans.add(client.prepare(target, files, GitHubSourceClient.TOTAL_BYTES / targets.size(), budget,
+                        sha -> jobs.progress(execution, new AnalysisJobs.Progress(target.repositoryId(), "RUNNING", sha, null))));
             }
-            List<Collected> collected = new ArrayList<>();
-            for (Plan plan : plans) {
+            Map<UUID,Access> access = new HashMap<>();
+            Map<UUID,Plan> original = new HashMap<>();
+            List<Plan> pendingFiles = new ArrayList<>();
+            for (Plan plan:plans) {
                 activeRepository = plan.target().repositoryId();
-                collected.add(client.collect(plan, budget));
-                jobs.progress(execution, new AnalysisJobs.Progress(activeRepository, "READY", plan.commitSha(), null));
+                original.put(activeRepository,plan);
+                var opened = client.openCollection(plan,budget); access.put(activeRepository,opened);
+                var saved = snapshots.files().read(execution,plan,opened.proof());
+                var allowance = snapshots.files().allowance(execution,plan.target());
+                int count=0,bytes=0;
+                List<FileEntry> selected = new ArrayList<>(); Map<String,Integer> exclusions = new TreeMap<>(plan.exclusions());
+                for (FileEntry file:plan.files()) {
+                    if (saved.containsKey(file.path()) && "COLLECTED".equals(saved.get(file.path()).state())) continue;
+                    if (count>=allowance.files() || bytes+file.size()>allowance.bytes()) exclusions.merge("download_budget",1,Integer::sum);
+                    else { selected.add(file); count++; bytes+=file.size(); }
+                }
+                if (!plan.files().isEmpty() && selected.isEmpty() && saved.values().stream().noneMatch(r->"COLLECTED".equals(r.state())))
+                    throw new Failure("collection_budget_exhausted");
+                pendingFiles.add(new Plan(plan.target(),plan.fullName(),plan.commitSha(),List.copyOf(selected),Map.copyOf(exclusions),plan.byteQuota()));
             }
+            List<Plan> fitted;
+            try { fitted = client.fitPlans(pendingFiles,budget,batch.size()==pending.size()?targets.size():0); }
+            catch (Failure failure) {
+                if (!Set.of("github_rate_limited","analysis_window_complete").contains(failure.code())) throw failure;
+                fitted = client.fitPlans(pendingFiles,budget,0);
+            }
+            for (Plan plan:fitted) {
+                activeRepository=plan.target().repositoryId();
+                Plan full = original.get(activeRepository);
+                for (FileEntry file:plan.files()) {
+                    access.put(activeRepository,client.refreshCollection(plan,access.get(activeRepository),budget));
+                    var downloaded = client.download(access.get(activeRepository),file,budget,()->snapshots.files().reserve(execution,full,file));
+                    var fileDraft = analyzer.analyze(List.of(new Collected(plan.target(),plan.commitSha(),
+                            downloaded.file()==null?List.of():List.of(downloaded.file()),
+                            downloaded.exclusion()==null?Map.of():Map.of(downloaded.exclusion(),1))));
+                    snapshots.files().collect(execution,full,file,fileDraft);
+                }
+                var proof = client.checkpointProof(plan,budget);
+                var result = snapshots.files().merge(execution,full,plan.exclusions(),proof);
+                snapshots.checkpoint(execution,result.draft(),result.bytes(),proof);
+            }
+            if (snapshots.completed(execution).size() != targets.size()) {
+                jobs.retry(execution, "analysis_window_complete", 1);
+                return true;
+            }
+            activeRepository = null;
+            client.publicationCapacity(targets.size(), budget);
             jobs.heartbeat(execution);
-            var draft = analyzer.analyze(collected);
-            jobs.heartbeat(execution);
-            if (draft.topics().stream().noneMatch(AnalysisSnapshots.Topic::active))
-                jobs.finish(execution, "INSUFFICIENT_EVIDENCE", "insufficient_code_evidence");
-            else snapshots.publish(execution, draft);
+            snapshots.publish(execution);
         } catch (Failure failure) {
             try {
-                if (activeRepository != null) {
+                if (activeRepository != null && !Set.of("github_rate_limited", "analysis_window_complete").contains(failure.code())) {
                     UUID repository = activeRepository;
                     var target = jobs.targets(execution).stream().filter(t -> t.repositoryId().equals(repository)).findFirst().orElseThrow();
                     jobs.progress(execution, new AnalysisJobs.Progress(repository, "FAILED", target.commitSha(), failure.code()));
                 }
                 if (failure.retrySeconds() >= 0) jobs.retry(execution, failure.code(),
-                        Math.min(86400, Math.max(failure.retrySeconds(), 5 * (1 << execution.attempt()))));
+                        Math.min(86400, Set.of("github_rate_limited", "analysis_window_complete").contains(failure.code()) ?
+                                Math.max(1, failure.retrySeconds()) : Math.max(failure.retrySeconds(), 5 * (1 << Math.min(execution.attempt(), 10)))));
                 else jobs.finish(execution, failure.code().equals("empty_repository") ? "INSUFFICIENT_EVIDENCE" : "FAILED", failure.code());
             } catch (RuntimeException stale) { log.debug("Analysis result discarded after execution changed"); }
         } catch (RuntimeException failure) {

@@ -6,7 +6,11 @@ import dev.devfield.repoq.project.github.GitHubSourceClient;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.time.*;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicInteger;
 
 final class MockSourceServer implements AutoCloseable {
@@ -28,10 +32,19 @@ final class MockSourceServer implements AutoCloseable {
         final Map<String, String> files = new LinkedHashMap<>();
         Repo(String id) { this.id = id; this.returnedId = id; this.name = "owner/repo" + id; files.put("src/App.java", JAVA); }
     }
+    final AtomicReference<Instant> now = new AtomicReference<>(Instant.now());
+    final Clock clock = new Clock() {
+        public ZoneId getZone() { return ZoneOffset.UTC; }
+        public Clock withZone(ZoneId zone) { return this; }
+        public Instant instant() { return now.get(); }
+    };
+    void resetWindow() { now.updateAndGet(t -> t.plusSeconds(3601)); headers.clear(); }
     final Map<String, Repo> repos = new ConcurrentHashMap<>();
     final List<String> paths = Collections.synchronizedList(new ArrayList<>());
     final AtomicInteger contentRequests = new AtomicInteger(), authorizationHeaders = new AtomicInteger();
     final Map<String, String> headers = new ConcurrentHashMap<>();
+    volatile Runnable beforeMetadata = () -> {};
+    final ExecutorService httpExecutor = Executors.newFixedThreadPool(8);
     volatile Runnable beforeBlob = () -> {};
     volatile int allStatus;
     volatile String rawResponse;
@@ -39,9 +52,11 @@ final class MockSourceServer implements AutoCloseable {
     private final ObjectMapper json = new ObjectMapper();
     MockSourceServer() throws Exception {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.setExecutor(httpExecutor);
         server.createContext("/", exchange -> {
             try {
                 String path = exchange.getRequestURI().getPath(); paths.add(path);
+                if (path.startsWith("/repositories/")) beforeMetadata.run();
                 if (exchange.getRequestHeaders().containsKey("Authorization")) authorizationHeaders.incrementAndGet();
                 Object body = Map.of("message", "SENSITIVE_RESPONSE"); int status = allStatus;
                 Repo repo = null;
@@ -88,6 +103,6 @@ final class MockSourceServer implements AutoCloseable {
         server.start();
     }
     Repo add(String id) { Repo repo = new Repo(id); repos.put(id, repo); return repo; }
-    GitHubSourceClient client() { return new GitHubSourceClient(URI.create("http://127.0.0.1:" + server.getAddress().getPort())); }
-    @Override public void close() { server.stop(0); }
+    GitHubSourceClient client() { return new GitHubSourceClient(URI.create("http://127.0.0.1:" + server.getAddress().getPort()), clock); }
+    @Override public void close() { server.stop(0); httpExecutor.shutdownNow(); }
 }

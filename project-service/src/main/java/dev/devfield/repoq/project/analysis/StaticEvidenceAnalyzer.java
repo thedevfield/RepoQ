@@ -17,7 +17,7 @@ import org.springframework.stereotype.Component;
 import org.xml.sax.InputSource;
 import org.xml.sax.helpers.DefaultHandler;
 
-/** Syntax-only rules: parse(), never analyze(), compile(), build tools or annotation processors. */
+/** Parse and attribute symbols only; never generate bytecode, run processors or execute repository code. */
 @Component
 public class StaticEvidenceAnalyzer {
     private record Rule(String summary, String topic) {}
@@ -81,35 +81,34 @@ public class StaticEvidenceAnalyzer {
             @Override public CharSequence getCharContent(boolean ignoreEncodingErrors) { return file.text(); }
         };
         try (var manager = compiler.getStandardFileManager(diagnostics, Locale.ROOT, java.nio.charset.StandardCharsets.UTF_8)) {
-            var task = (JavacTask) compiler.getTask(null, manager, diagnostics,
+            manager.setLocation(StandardLocation.CLASS_PATH, List.of());
+            manager.setLocation(StandardLocation.SOURCE_PATH, List.of());
+            var task = (JavacTask) compiler.getTask(null, trustedSymbols(manager), diagnostics,
                     List.of("-proc:none", "--release", "21"), null, List.of(source));
             List<CompilationUnitTree> units = new ArrayList<>();
             task.parse().forEach(units::add);
             if (diagnostics.getDiagnostics().stream().anyMatch(d -> d.getKind() == Diagnostic.Kind.ERROR)) return false;
-            var positions = Trees.instance(task).getSourcePositions();
+            task.analyze();
+            var trees = Trees.instance(task);
+            var positions = trees.getSourcePositions();
             for (CompilationUnitTree unit : units) {
-                Map<String, String> imports = new HashMap<>();
-                // shortcut: syntax-only explicit imports; add symbol resolution when broader Java support is required.
-                for (ImportTree i : unit.getImports()) {
-                    if (i.isStatic()) continue;
-                    String name = i.getQualifiedIdentifier().toString();
-                    if (!name.endsWith(".*")) imports.put(name.substring(name.lastIndexOf('.') + 1), name);
-                }
-                Set<String> localTypes = new HashSet<>();
-                new TreePathScanner<Void, Void>() {
-                    @Override public Void visitClass(ClassTree node, Void unused) {
-                        localTypes.add(node.getSimpleName().toString());
-                        return super.visitClass(node, unused);
-                    }
-                }.scan(unit, null);
                 Set<String> emitted = new HashSet<>();
                 new TreePathScanner<Void, Void>() {
                     String resolved(Tree type) {
                         if (type == null) return "";
-                        if (type instanceof ParameterizedTypeTree p) return resolved(p.getType());
-                        String name = type.toString();
-                        if (localTypes.contains(name)) return "";
-                        return imports.getOrDefault(name, name);
+                        var path = com.sun.source.util.TreePath.getPath(unit, type);
+                        if (path == null) return "";
+                        var mirror = trees.getTypeMirror(path);
+                        if (mirror == null || mirror.getKind() != javax.lang.model.type.TypeKind.DECLARED) return "";
+                        var element = ((javax.lang.model.type.DeclaredType) mirror).asElement();
+                        if (!(element instanceof javax.lang.model.element.TypeElement declaration) || trees.getPath(declaration)!=null) return "";
+                        // An unresolved ancestor could declare a member type that hides an import.
+                        for (var scope=getCurrentPath();scope!=null;scope=scope.getParentPath()) {
+                            if (!(scope.getLeaf() instanceof ClassTree)) continue;
+                            var owner=trees.getElement(scope);
+                            if (owner instanceof javax.lang.model.element.TypeElement enclosing && !knownAncestors(enclosing,new HashSet<>())) return "";
+                        }
+                        return declaration.getQualifiedName().toString();
                     }
                     void emit(Tree node, Rule rule) {
                         if (rule == null || evidence.size() >= 200 || !emitted.add(rule.summary())) return;
@@ -142,6 +141,62 @@ public class StaticEvidenceAnalyzer {
             }
             return true;
         } catch (Exception e) { return false; }
+    }
+
+    private boolean knownAncestors(javax.lang.model.element.TypeElement type, Set<javax.lang.model.element.TypeElement> visited) {
+        if (!visited.add(type)) return true;
+        List<javax.lang.model.type.TypeMirror> parents=new ArrayList<>(type.getInterfaces());
+        parents.add(type.getSuperclass());
+        for (var parent:parents) {
+            if(parent.getKind()==javax.lang.model.type.TypeKind.ERROR) return false;
+            if(parent instanceof javax.lang.model.type.DeclaredType declared && declared.asElement() instanceof javax.lang.model.element.TypeElement ancestor &&
+                    !knownAncestors(ancestor,visited)) return false;
+        }
+        return true;
+    }
+
+    // Resolve only installed, trusted framework class files; never fetch a repository's dependencies.
+    private JavaFileManager trustedSymbols(StandardJavaFileManager delegate) {
+        ClassLoader loader = StaticEvidenceAnalyzer.class.getClassLoader();
+        class Binary extends SimpleJavaFileObject {
+            final String name;
+            Binary(String name) { super(URI.create("trusted:///" + name.replace('.', '/') + ".class"), Kind.CLASS); this.name = name; }
+            @Override public java.io.InputStream openInputStream() throws java.io.IOException {
+                var input = loader.getResourceAsStream(name.replace('.', '/') + ".class");
+                if (input == null) throw new java.io.FileNotFoundException();
+                return input;
+            }
+        }
+        return new ForwardingJavaFileManager<StandardJavaFileManager>(delegate) {
+            @Override public Iterable<JavaFileObject> list(Location location, String packageName, Set<JavaFileObject.Kind> kinds, boolean recurse) throws java.io.IOException {
+                List<JavaFileObject> result = new ArrayList<>();
+                super.list(location, packageName, kinds, recurse).forEach(result::add);
+                if (location != StandardLocation.CLASS_PATH || !kinds.contains(JavaFileObject.Kind.CLASS) ||
+                        !(packageName.startsWith("org.springframework.") || packageName.equals("jakarta.persistence"))) return result;
+                String prefix = packageName.replace('.', '/') + "/";
+                Set<String> names = new TreeSet<>();
+                var resources = loader.getResources(prefix.substring(0, prefix.length() - 1));
+                while (resources.hasMoreElements()) {
+                    var url = resources.nextElement();
+                    if (url.openConnection() instanceof java.net.JarURLConnection jar) {
+                        var entries = jar.getJarFile().entries();
+                        while (entries.hasMoreElements()) {
+                            String name = entries.nextElement().getName();
+                            if (name.startsWith(prefix) && name.endsWith(".class") && name.indexOf('/', prefix.length()) < 0)
+                                names.add(name.substring(0, name.length() - 6).replace('/', '.'));
+                        }
+                    }
+                }
+                for (String name : names) result.add(new Binary(name));
+                return result;
+            }
+            @Override public String inferBinaryName(Location location, JavaFileObject file) {
+                return file instanceof Binary binary ? binary.name : super.inferBinaryName(location, file);
+            }
+            @Override public JavaFileObject getJavaFileForOutput(Location location, String name, JavaFileObject.Kind kind, FileObject sibling) {
+                throw new IllegalStateException("Source output is forbidden");
+            }
+        };
     }
 
     private void dependency(Member member, TextFile file, List<Evidence> evidence) {

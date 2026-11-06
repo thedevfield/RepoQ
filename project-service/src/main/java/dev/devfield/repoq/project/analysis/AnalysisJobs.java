@@ -15,7 +15,7 @@ public class AnalysisJobs {
     public record Target(UUID repositoryId, String githubRepositoryId, String commitSha) {}
     record Member(UUID id, String githubId, String visibility, String accessState) {}
     record Locked(UUID id, UUID projectId, long version, long currentVersion, String state,
-                  int attempt, boolean leaseValid, boolean due, String analysisVersion,
+                  int attempt, int failures, boolean alive, boolean leaseValid, boolean due, String analysisVersion,
                   List<Progress> progress, List<Member> members) {}
 
     private final JdbcTemplate db;
@@ -23,6 +23,8 @@ public class AnalysisJobs {
     private final ObjectMapper json = new ObjectMapper();
 
     public AnalysisJobs(JdbcTemplate db, AnalysisSettings settings) { this.db = db; this.settings = settings; }
+
+    int maxJobSeconds() { return settings.maxJobSeconds(); }
 
     @Transactional
     public List<Target> targets(Execution execution) {
@@ -33,25 +35,27 @@ public class AnalysisJobs {
 
     public List<UUID> queued(int limit) {
         checkLimit(limit);
-        return db.query("SELECT id FROM project.analysis_job WHERE state='QUEUED' AND next_attempt_at<=clock_timestamp() " +
-                "ORDER BY next_attempt_at,created_at,id LIMIT ?", (rs, n) -> rs.getObject(1, UUID.class), limit);
+        return db.query("SELECT id FROM project.analysis_job WHERE state='QUEUED' AND (next_attempt_at<=clock_timestamp() OR created_at+make_interval(secs=>?)<=clock_timestamp()) " +
+                "ORDER BY next_attempt_at,created_at,id LIMIT ?", (rs, n) -> rs.getObject(1, UUID.class), settings.maxJobSeconds(), limit);
     }
 
     public List<UUID> expired(int limit) {
         checkLimit(limit);
         return db.query("SELECT id FROM project.analysis_job WHERE state='RUNNING' " +
                 "AND (lease_expires_at IS NULL OR lease_expires_at<=clock_timestamp() OR started_at IS NULL OR " +
-                "started_at+make_interval(secs=>?)<=clock_timestamp()) ORDER BY id LIMIT ?",
-                (rs, n) -> rs.getObject(1, UUID.class), settings.maxRunSeconds(), limit);
+                "started_at+make_interval(secs=>?)<=clock_timestamp() OR created_at+make_interval(secs=>?)<=clock_timestamp()) ORDER BY id LIMIT ?",
+                (rs, n) -> rs.getObject(1, UUID.class), settings.maxRunSeconds(), settings.maxJobSeconds(), limit);
     }
 
     @Transactional
     public Execution claim(UUID id) {
         Locked job = lock(id);
-        if (!"QUEUED".equals(job.state()) || !job.due()) return null;
+        if (!"QUEUED".equals(job.state())) return null;
+        if (!job.alive()) { terminal(id, "FAILED", "analysis_lifetime_exceeded"); return null; }
+        if (!job.due()) return null;
         if (!compositionMatches(job)) { terminal(job.id(), "CANCELLED", "membership_changed"); return null; }
         if (!publicMembers(job)) { terminal(job.id(), "FAILED", accessFailure(job)); return null; }
-        if (job.attempt() >= settings.maxAttempts()) { terminal(id, "FAILED", "attempts_exhausted"); return null; }
+        if (job.failures() >= settings.maxFailures()) { terminal(id, "FAILED", "failures_exhausted"); return null; }
         db.update("UPDATE project.analysis_job SET state='RUNNING',attempt_count=attempt_count+1," +
                 "started_at=clock_timestamp(),finished_at=NULL,failure_code=NULL," +
                 "lease_expires_at=clock_timestamp()+make_interval(secs=>?) WHERE id=?", settings.leaseSeconds(), id);
@@ -89,7 +93,8 @@ public class AnalysisJobs {
         if (!Set.of("FAILED", "INSUFFICIENT_EVIDENCE").contains(state)) throw new IllegalArgumentException("Invalid outcome");
         checkCode(code);
         current(execution);
-        writeCurrent(execution, "state=?,failure_code=?,finished_at=clock_timestamp(),lease_expires_at=NULL", state, code);
+        writeCurrent(execution, "state=?,failure_code=?,finished_at=clock_timestamp(),lease_expires_at=NULL," +
+                "failure_count=failure_count+?", state, code, "FAILED".equals(state) ? 1 : 0);
     }
 
     @Transactional
@@ -102,8 +107,9 @@ public class AnalysisJobs {
     @Transactional
     public boolean recover(UUID id) {
         Locked job = lock(id);
-        if (!"RUNNING".equals(job.state()) || job.leaseValid()) return false;
-        if (!compositionMatches(job)) terminal(id, "CANCELLED", "membership_changed");
+        if (!"RUNNING".equals(job.state()) || job.leaseValid() && job.alive()) return false;
+        if (!job.alive()) terminal(id, "FAILED", "analysis_lifetime_exceeded");
+        else if (!compositionMatches(job)) terminal(id, "CANCELLED", "membership_changed");
         else if (!publicMembers(job)) terminal(id, "FAILED", accessFailure(job));
         else requeue(job, "lease_expired", 0, true);
         return true;
@@ -111,13 +117,18 @@ public class AnalysisJobs {
 
     private void requeue(Locked job, String code, int delay, boolean recovery) {
         Execution execution = new Execution(job.id(), job.projectId(), job.version(), job.attempt());
-        if (job.attempt() >= settings.maxAttempts()) {
-            if (recovery) terminal(job.id(), "FAILED", "attempts_exhausted");
-            else writeCurrent(execution, "state='FAILED',failure_code='attempts_exhausted',finished_at=clock_timestamp(),lease_expires_at=NULL");
+        boolean waiting = Set.of("github_rate_limited", "analysis_window_complete").contains(code);
+        if (!job.alive() || !waiting && job.failures() + 1 >= settings.maxFailures()) {
+            String reason = !job.alive() ? "analysis_lifetime_exceeded" : "failures_exhausted";
+            if (recovery) {
+                terminal(job.id(), "FAILED", reason);
+                if (!waiting) db.update("UPDATE project.analysis_job SET failure_count=failure_count+1 WHERE id=?", job.id());
+            } else writeCurrent(execution, "state='FAILED',failure_code=?,finished_at=clock_timestamp()," +
+                    "lease_expires_at=NULL,failure_count=failure_count+?", reason, waiting ? 0 : 1);
             return;
         }
-        List<Progress> reset = job.progress().stream().map(p -> new Progress(p.repositoryId(), "QUEUED", p.commitSha(), null)).toList();
-        String changes = "state='QUEUED',lease_expires_at=NULL,failure_code=?," +
+        List<Progress> reset = job.progress().stream().map(p -> new Progress(p.repositoryId(), "READY".equals(p.state()) ? "READY" : "QUEUED", p.commitSha(), null)).toList();
+        String changes = "state='QUEUED',lease_expires_at=NULL,failure_count=failure_count+" + (waiting ? 0 : 1) + ",failure_code=?," +
                 "next_attempt_at=clock_timestamp()+make_interval(secs=>?),repository_progress=CAST(? AS jsonb)";
         if (recovery) db.update("UPDATE project.analysis_job SET " + changes + " WHERE id=?", code, delay, encode(reset), job.id());
         else writeCurrent(execution, changes, code, delay, encode(reset));
@@ -125,10 +136,10 @@ public class AnalysisJobs {
 
     void writeCurrent(Execution execution, String changes, Object... values) {
         List<Object> args = new ArrayList<>(Arrays.asList(values));
-        args.add(execution.jobId()); args.add(execution.attempt()); args.add(settings.maxRunSeconds());
+        args.add(execution.jobId()); args.add(execution.attempt()); args.add(settings.maxRunSeconds()); args.add(settings.maxJobSeconds());
         int updated = db.update("UPDATE project.analysis_job SET " + changes + " WHERE id=? AND state='RUNNING' " +
                 "AND attempt_count=? AND lease_expires_at>clock_timestamp() " +
-                "AND started_at+make_interval(secs=>?)>clock_timestamp()", args.toArray());
+                "AND started_at+make_interval(secs=>?)>clock_timestamp() AND created_at+make_interval(secs=>?)>clock_timestamp()", args.toArray());
         if (updated != 1) throw new IllegalStateException("Stale analysis execution");
     }
 
@@ -141,7 +152,7 @@ public class AnalysisJobs {
         if (execution == null) throw new IllegalArgumentException("Missing execution");
         Locked job = lock(execution.jobId());
         if (!job.projectId().equals(execution.projectId()) || job.version() != execution.membershipVersion() ||
-                job.attempt() != execution.attempt() || !"RUNNING".equals(job.state()) || !job.leaseValid() ||
+                job.attempt() != execution.attempt() || !job.alive() || !"RUNNING".equals(job.state()) || !job.leaseValid() ||
                 !compositionMatches(job) || !publicMembers(job)) throw new IllegalStateException("Stale analysis execution");
         return job;
     }
@@ -159,9 +170,9 @@ public class AnalysisJobs {
         // Read the wall clock after waiting for locks; transaction-start time can revive an expired lease.
         return db.queryForObject("SELECT membership_version,state,attempt_count," +
                 "COALESCE(lease_expires_at>clock_timestamp() AND started_at+make_interval(secs=>?)>clock_timestamp(),false),next_attempt_at<=clock_timestamp()," +
-                "analysis_version,repository_progress::text FROM project.analysis_job WHERE id=?", (rs, n) ->
-                new Locked(id, project, rs.getLong(1), version, rs.getString(2), rs.getInt(3), rs.getBoolean(4),
-                        rs.getBoolean(5), rs.getString(6), decode(rs.getString(7)), members(project)), settings.maxRunSeconds(), id);
+                "analysis_version,repository_progress::text,failure_count,created_at+make_interval(secs=>?)>clock_timestamp() FROM project.analysis_job WHERE id=?", (rs, n) ->
+                new Locked(id, project, rs.getLong(1), version, rs.getString(2), rs.getInt(3), rs.getInt(8), rs.getBoolean(9), rs.getBoolean(4),
+                        rs.getBoolean(5), rs.getString(6), decode(rs.getString(7)), members(project)), settings.maxRunSeconds(), settings.maxJobSeconds(), id);
     }
 
     private List<Member> members(UUID project) {

@@ -38,6 +38,8 @@ public class AnalysisSnapshots {
         }
     }
 
+    private final AnalysisFiles files;
+    public AnalysisFiles files() { return files; }
     private final JdbcTemplate db;
     private final AnalysisJobs jobs;
     private final TransactionTemplate tx;
@@ -46,17 +48,129 @@ public class AnalysisSnapshots {
     public AnalysisSnapshots(JdbcTemplate db, AnalysisJobs jobs, TransactionTemplate tx,
                              Optional<PublicAccessVerifier> publicAccess) {
         this.db = db; this.jobs = jobs; this.tx = tx; this.publicAccess = publicAccess;
+        this.files = new AnalysisFiles(db, jobs, tx);
+    }
+
+    // Change this whenever extraction rules or collection policy invalidate stored results.
+    static final String CHECKPOINT_POLICY = "java-symbol-files-v3";
+    public record Checkpoint(UUID repositoryId, String commitSha, int files, int bytes, Draft draft) {}
+
+    public Set<UUID> completed(AnalysisJobs.Execution execution) {
+        return tx.execute(status -> {
+            AnalysisJobs.Locked job = jobs.current(execution);
+            var invalid = db.queryForObject("SELECT count(*) FROM project.analysis_repository_checkpoint WHERE analysis_job_id=? " +
+                    "AND (expires_at<=clock_timestamp() OR membership_version<>? OR analysis_version<>? OR analyzer_policy_version<>?)",
+                    Integer.class, job.id(), job.version(), job.analysisVersion(), CHECKPOINT_POLICY);
+            // Never re-download an expired or incompatible completed member under the same job budget.
+            if (invalid != 0) throw new dev.devfield.repoq.project.github.GitHubSourceClient.Failure("checkpoint_invalidated");
+            return Set.copyOf(db.query("SELECT project_repository_id FROM project.analysis_repository_checkpoint WHERE analysis_job_id=?",
+                    (rs, n) -> rs.getObject(1, UUID.class), job.id()));
+        });
+    }
+
+    public void checkpoint(AnalysisJobs.Execution execution, Draft draft, int bytes, PublicAccessVerifier.Proof proof) {
+        validate(draft, false);
+        if (draft.members().size() != 1 || !draft.roles().isEmpty() || !draft.relations().isEmpty() || bytes < 0 || bytes > 2097152) throw invalid();
+        Member member = draft.members().getFirst();
+        var sources = List.of(new PublicAccessVerifier.Source(member.repositoryId(), member.githubRepositoryId(), member.commitSha()));
+        if (proof == null || !proof.validFor(sources)) throw new IllegalStateException("Public access verification expired");
+        tx.executeWithoutResult(status -> {
+            AnalysisJobs.Locked job = jobs.current(execution);
+            if (!proof.validFor(sources) || job.members().stream().noneMatch(m -> m.id().equals(member.repositoryId()) &&
+                    m.githubId().equals(member.githubRepositoryId())) || job.progress().stream().noneMatch(p ->
+                    p.repositoryId().equals(member.repositoryId()) && member.commitSha().equals(p.commitSha()))) throw invalid();
+            int files = draft.coverage().getFirst().collectedFiles();
+            int index = job.members().stream().map(AnalysisJobs.Member::id).toList().indexOf(member.repositoryId());
+            int quota = 40 / job.members().size() + (index < 40 % job.members().size() ? 1 : 0);
+            if (files > quota || bytes > 2097152 / job.members().size()) throw invalid();
+            db.update("INSERT INTO project.analysis_repository_checkpoint(analysis_job_id,project_id,project_repository_id," +
+                    "membership_version,github_repository_id,commit_sha,analysis_version,analyzer_policy_version," +
+                    "completed_file_count,completed_bytes,draft,expires_at) " +
+                    "SELECT ?,?,?,?,?,?,?,?,?,?,CAST(? AS jsonb),created_at+make_interval(secs=>?) FROM project.analysis_job WHERE id=?",
+                    job.id(), job.projectId(), member.repositoryId(), job.version(), member.githubRepositoryId(), member.commitSha(),
+                    job.analysisVersion(), CHECKPOINT_POLICY, files, bytes, jobs.encode(draft), jobs.maxJobSeconds(), job.id());
+            jobs.progress(execution, new AnalysisJobs.Progress(member.repositoryId(), "READY", member.commitSha(), null));
+            jobs.current(execution);
+            if (!proof.validFor(sources)) throw new IllegalStateException("Public access verification expired");
+        });
+    }
+
+    Draft checkpointDraft(AnalysisJobs.Execution execution) {
+        return tx.execute(status -> {
+            AnalysisJobs.Locked job = jobs.current(execution);
+            Set<UUID> completed = completed(execution);
+            if (!completed.equals(new HashSet<>(job.members().stream().map(AnalysisJobs.Member::id).toList()))) throw invalid();
+            List<Checkpoint> rows = db.query("SELECT project_repository_id,commit_sha,completed_file_count,completed_bytes,draft::text " +
+                    "FROM project.analysis_repository_checkpoint WHERE analysis_job_id=? ORDER BY project_repository_id", (rs, n) -> {
+                try { return new Checkpoint(rs.getObject(1, UUID.class), rs.getString(2), rs.getInt(3), rs.getInt(4),
+                        new com.fasterxml.jackson.databind.ObjectMapper().readValue(rs.getString(5), Draft.class)); }
+                catch (Exception e) { throw invalid(); }
+            }, job.id());
+            if (rows.stream().mapToInt(Checkpoint::files).sum() > 40 || rows.stream().mapToInt(Checkpoint::bytes).sum() > 2097152) throw invalid();
+            List<Member> members = new ArrayList<>(); List<Evidence> evidence = new ArrayList<>();
+            List<Coverage> coverage = new ArrayList<>(); Map<String, Topic> topics = new TreeMap<>();
+            for (Checkpoint row : rows) {
+                Draft d = row.draft(); validate(d, false);
+                if (d.members().size() != 1 || !d.members().getFirst().repositoryId().equals(row.repositoryId()) ||
+                        !d.members().getFirst().commitSha().equals(row.commitSha()) ||
+                        d.coverage().getFirst().collectedFiles() != row.files()) throw invalid();
+                members.addAll(d.members()); coverage.addAll(d.coverage());
+                // Keep the existing whole-snapshot evidence bound when merging independently analyzed members.
+                for (Evidence e : d.evidence()) if (evidence.size() < 200) evidence.add(e);
+                for (Topic t : d.topics()) if (evidence.stream().anyMatch(e -> e.id().equals(t.evidenceId()))) topics.putIfAbsent(t.key(), t);
+            }
+            Draft result = new Draft(members, evidence, List.copyOf(topics.values()), List.of(), List.of(), coverage);
+            validate(result, false);
+            return result;
+        });
+    }
+
+    public void cleanupCheckpoints() {
+        files.cleanup();
+        // Deletion takes no parent locks; it cannot invert the USER -> PROJECT -> job write order.
+        db.update("DELETE FROM project.analysis_repository_checkpoint c WHERE (analysis_job_id,project_repository_id) IN " +
+                "(SELECT c.analysis_job_id,c.project_repository_id FROM project.analysis_repository_checkpoint c " +
+                "JOIN project.analysis_job j ON j.id=c.analysis_job_id JOIN project.registered_project p ON p.id=c.project_id " +
+                "JOIN project.project_repository r ON r.id=c.project_repository_id " +
+                "WHERE c.expires_at<=clock_timestamp() OR j.state NOT IN ('QUEUED','RUNNING') OR p.state<>'ACTIVE' " +
+                "OR p.membership_version<>c.membership_version OR r.removed_at IS NOT NULL OR r.visibility<>'PUBLIC' " +
+                "OR r.access_state<>'ACTIVE' OR EXISTS (SELECT 1 FROM project.project_write_fence f WHERE f.state<>'ACTIVE' " +
+                "AND f.owner_user_id=p.owner_user_id AND (f.scope='USER' OR f.project_id=p.id)) LIMIT 100)");
+    }
+
+    public UUID publish(AnalysisJobs.Execution execution) {
+        var sources = jobs.targets(execution).stream().map(t -> new PublicAccessVerifier.Source(
+                t.repositoryId(), t.githubRepositoryId(), t.commitSha())).toList();
+        var proof = verify(sources);
+        // Do not materialize stored evidence until current remote public access is confirmed.
+        Draft draft = checkpointDraft(execution);
+        if (!proof.validFor(sources)) throw new IllegalStateException("Public access verification expired");
+        if (draft.topics().stream().noneMatch(Topic::active)) {
+            jobs.finish(execution, "INSUFFICIENT_EVIDENCE", "insufficient_code_evidence");
+            return null;
+        }
+        return publish(execution, draft, sources, proof);
     }
 
     public UUID publish(AnalysisJobs.Execution execution, Draft draft) {
-        if (TransactionSynchronizationManager.isActualTransactionActive())
-            throw new IllegalStateException("Public access verification must run outside a transaction");
         validate(draft);
-        PublicAccessVerifier verifier = publicAccess.orElseThrow(() -> new IllegalStateException("Public access verifier unavailable"));
         var sources = draft.members().stream().map(m -> new PublicAccessVerifier.Source(
                 m.repositoryId(), m.githubRepositoryId(), m.commitSha())).toList();
+        return publish(execution, draft, sources, verify(sources));
+    }
+
+    private PublicAccessVerifier.Proof verify(List<PublicAccessVerifier.Source> sources) {
+        if (TransactionSynchronizationManager.isActualTransactionActive())
+            throw new IllegalStateException("Public access verification must run outside a transaction");
+        PublicAccessVerifier verifier = publicAccess.orElseThrow(() -> new IllegalStateException("Public access verifier unavailable"));
         var proof = verifier.verify(sources);
         if (proof == null || !proof.validFor(sources)) throw new IllegalStateException("Public access not verified");
+        return proof;
+    }
+
+    private UUID publish(AnalysisJobs.Execution execution, Draft draft, List<PublicAccessVerifier.Source> sources,
+                         PublicAccessVerifier.Proof proof) {
+        validate(draft);
         return tx.execute(status -> {
             AnalysisJobs.Locked job = jobs.current(execution);
             if (!proof.validFor(sources)) throw new IllegalStateException("Public access verification expired");
@@ -100,7 +214,9 @@ public class AnalysisSnapshots {
         });
     }
 
-    private static void validate(Draft d) {
+    private static void validate(Draft d) { validate(d, true); }
+
+    static void validate(Draft d, boolean requireTopic) {
         if (d == null || d.members().isEmpty() || d.members().size() > 20 || d.evidence().size() > 200 ||
                 d.topics().size() > 64 || d.roles().size() > 100 || d.relations().size() > 100) throw invalid();
         Map<UUID, Member> members = new HashMap<>();
@@ -129,7 +245,7 @@ public class AnalysisSnapshots {
                 usable = true;
             }
         }
-        if (!usable) throw invalid();
+        if (requireTopic && !usable) throw invalid();
         for (Role r : d.roles()) {
             if (!members.containsKey(r.memberId()) || !validSummary(r.summary())) throw invalid();
             checkReferences(r.claimType(), r.evidenceIds(), Set.of(r.memberId()), evidence);

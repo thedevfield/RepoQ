@@ -59,6 +59,47 @@ class StaticEvidenceAnalyzerTest {
         assertTrue(analyze(new TextFile("A.java", "import org.springframework.web.bind.annotation.RestController; @RestController class A {")).topics().isEmpty());
         assertTrue(analyze(new TextFile("A.java", "@interface RestController {} @RestController class A {}")).topics().isEmpty());
     }
+    @Test void inheritedTypesAndInvalidStaticReferencesNeverBecomeHttpFacts() {
+        for (String code : List.of(
+                "class Parent { static class HttpClient {} } class Child extends Parent { HttpClient value; }",
+                "class Child extends MissingParent { HttpClient value; }",
+                "class Example { void run() { class Parent extends Missing {} class Child extends Parent { HttpClient value; } } }",
+                "class Example<HttpClient> { static void run() { HttpClient value; } }",
+                "class Example<HttpClient> { static class Nested { HttpClient value; } }")) {
+            var d = analyze(new TextFile("Example.java", "import java.net.http.HttpClient; " + code));
+            assertTrue(d.evidence().isEmpty(), code); assertTrue(d.topics().isEmpty(), code);
+        }
+    }
+    @Test void localTypeOnlyShadowsAfterItsDeclaration() {
+        var d = analyze(new TextFile("Example.java", "import java.net.http.HttpClient; class Example { void run() { HttpClient real; class HttpClient {} HttpClient local; } }"));
+        assertEquals(1, d.evidence().size()); assertEquals("EXTERNAL_INTEGRATION", d.topics().getFirst().key());
+    }
+    @Test void typeParametersAreScopedAndNeverBecomeTechnologyFacts() {
+        for (String declaration : List.of(
+                "class Example<HttpClient> { HttpClient value; }",
+                "class Example { <HttpClient> void use(HttpClient value) {} }",
+                "class Example<HttpClient> { class Nested<T> { HttpClient value; } }",
+                "class Example { class Nested<HttpClient> { HttpClient value; } }",
+                "class Example { void example() { class HttpClient {} HttpClient value; } }",
+                "class Example {}",
+                "class Example { String example = \"HttpClient value;\"; /* HttpClient value; */ }")) {
+            var draft = analyze(new TextFile("Example.java", "import java.net.http.HttpClient; " + declaration));
+            assertTrue(draft.evidence().isEmpty(), declaration);
+            assertTrue(draft.topics().isEmpty(), declaration);
+        }
+    }
+    @Test void unshadowedImportsAndFullyQualifiedTypesRemainUsable() {
+        for (String declaration : List.of(
+                "class Example { HttpClient value; }",
+                "class Example<HttpClient> { java.net.http.HttpClient value; }",
+                "class Example { <HttpClient> void generic(HttpClient value) {} HttpClient actual; }",
+                "class Example { class Nested<HttpClient> { HttpClient value; } HttpClient actual; }",
+                "class Example { void method() { class HttpClient {} } HttpClient actual; }")) {
+            var draft = analyze(new TextFile("Example.java", "import java.net.http.HttpClient; " + declaration));
+            assertEquals(1, draft.evidence().size(), declaration);
+            assertEquals("EXTERNAL_INTEGRATION", draft.topics().getFirst().key());
+        }
+    }
     @Test void dependencyDeclarationsAreNotSufficientForReady() {
         var draft = analyze(new TextFile("pom.xml", """
                 <project><dependencies><dependency><groupId>org.springframework.boot</groupId>

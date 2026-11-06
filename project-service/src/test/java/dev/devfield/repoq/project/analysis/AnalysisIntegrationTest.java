@@ -106,10 +106,10 @@ class AnalysisIntegrationTest {
         assertThrows(IllegalStateException.class, () -> jobs.retry(first, "network_error", 0));
         assertThrows(IllegalArgumentException.class, () -> jobs.progress(second, new AnalysisJobs.Progress(f.members().getFirst().id(), "READY", "b".repeat(40), null)));
         expire(f); jobs.recover(f.job());
-        var third = jobs.claim(f.job()); assertEquals(settings.maxAttempts(), third.attempt());
+        var third = jobs.claim(f.job()); assertEquals(settings.maxFailures(), third.attempt());
         expire(f); jobs.recover(f.job());
         assertEquals("FAILED", state(f)); assertNull(jobs.claim(f.job()));
-        assertEquals("attempts_exhausted", db.queryForObject("SELECT failure_code FROM project.analysis_job WHERE id=?", String.class, f.job()));
+        assertEquals("failures_exhausted", db.queryForObject("SELECT failure_code FROM project.analysis_job WHERE id=?", String.class, f.job()));
     }
 
     @Test
@@ -348,6 +348,182 @@ class AnalysisIntegrationTest {
         sqlState("23503", () -> db.update("INSERT INTO project.analysis_snapshot " +
                 "(id,project_id,analysis_job_id,membership_version,analysis_version,roles,relations,coverage) " +
                 "VALUES (?,?,?,1,'v1','[]','[]','[]')", UUID.randomUUID(), a.project(), c.job()));
+    }
+
+    private PublicAccessVerifier.Proof proof(Draft d) {
+        return new PublicAccessVerifier.Proof(Set.copyOf(d.members().stream().map(m ->
+                new PublicAccessVerifier.Source(m.repositoryId(), m.githubRepositoryId(), m.commitSha())).toList()), java.time.Instant.now());
+    }
+
+    @Test void checkpointRestartAndOldAttemptCannotWriteOrRepublish() {
+        Fixture f = fixture(1); var first = jobs.claim(f.job()); Draft d = ready(f, first);
+        productionSnapshots.checkpoint(first, d, 100, proof(d));
+        expire(f); assertTrue(jobs.recover(f.job()));
+        var second = jobs.claim(f.job());
+        assertThrows(IllegalStateException.class, () -> productionSnapshots.checkpoint(first, d, 100, proof(d)));
+        var restarted = new AnalysisSnapshots(db, jobs, tx, Optional.of(sources -> proof(d)));
+        assertEquals(d, restarted.checkpointDraft(second));
+        restarted.publish(second, restarted.checkpointDraft(second));
+        assertEquals("READY", state(f));
+        assertEquals(0, number("SELECT count(*) FROM project.analysis_repository_checkpoint WHERE analysis_job_id=?", f.job()));
+        assertThrows(IllegalStateException.class, () -> restarted.checkpointDraft(second));
+    }
+
+    @Test void concurrentCheckpointUniquenessAndRollback() throws Exception {
+        Fixture f = fixture(1); var run = jobs.claim(f.job()); Draft d = ready(f, run);
+        try (var pool = Executors.newFixedThreadPool(2)) {
+            CountDownLatch start = new CountDownLatch(1);
+            Callable<Boolean> save = () -> { start.await();
+                try { productionSnapshots.checkpoint(run, d, 100, proof(d)); return true; }
+                catch (DataAccessException duplicate) { return false; }
+            };
+            var a = pool.submit(save); var b = pool.submit(save); start.countDown();
+            assertNotEquals(a.get(10, TimeUnit.SECONDS), b.get(10, TimeUnit.SECONDS));
+        }
+        assertEquals(1, number("SELECT count(*) FROM project.analysis_repository_checkpoint WHERE analysis_job_id=?", f.job()));
+        Fixture rollback = fixture(1); var other = jobs.claim(rollback.job()); Draft rd = ready(rollback, other);
+        jobs.progress(other, new AnalysisJobs.Progress(rollback.members().getFirst().id(), "RUNNING", SHA, null));
+        assertThrows(DataAccessException.class, () -> tx.executeWithoutResult(status -> {
+            productionSnapshots.checkpoint(other, rd, 100, proof(rd));
+            db.queryForObject("SELECT 1/0", Integer.class);
+        }));
+        assertEquals("RUNNING", db.queryForObject("SELECT repository_progress->0->>'state' FROM project.analysis_job WHERE id=?", String.class, rollback.job()));
+        assertEquals(0, number("SELECT count(*) FROM project.analysis_repository_checkpoint WHERE analysis_job_id=?", rollback.job()));
+    }
+
+    @Test void checkpointCancellationMembershipPolicyAndExpiryFailClosed() {
+        for (String reason : List.of("cancel", "membership", "policy", "expired", "private", "fence")) {
+            Fixture f = fixture(1); var run = jobs.claim(f.job()); Draft d = ready(f, run);
+            productionSnapshots.checkpoint(run, d, 100, proof(d));
+            switch (reason) {
+                case "cancel" -> db.update("UPDATE project.analysis_job SET state='CANCELLED' WHERE id=?", f.job());
+                case "membership" -> db.update("UPDATE project.registered_project SET membership_version=membership_version+1 WHERE id=?", f.project());
+                case "policy" -> db.update("UPDATE project.analysis_repository_checkpoint SET analyzer_policy_version='old' WHERE analysis_job_id=?", f.job());
+                case "expired" -> db.update("UPDATE project.analysis_repository_checkpoint SET created_at=clock_timestamp()-interval '2 hours',expires_at=clock_timestamp()-interval '1 hour' WHERE analysis_job_id=?", f.job());
+                case "private" -> makePrivate(f);
+                case "fence" -> db.update("UPDATE project.project_write_fence SET state='DELETING',deletion_job_id=gen_random_uuid() WHERE project_id=?", f.project());
+            }
+            assertThrows(RuntimeException.class, () -> productionSnapshots.checkpointDraft(run));
+            assertEquals(0, snapshots(f));
+            productionSnapshots.cleanupCheckpoints();
+            if (!reason.equals("policy")) assertEquals(0, number("SELECT count(*) FROM project.analysis_repository_checkpoint WHERE analysis_job_id=?", f.job()));
+        }
+    }
+
+    @Test void checkpointProofTtlAndDatabaseConstraints() {
+        Fixture f = fixture(1); var run = jobs.claim(f.job()); Draft d = ready(f, run);
+        var stale = new PublicAccessVerifier.Proof(proof(d).sources(), java.time.Instant.now().minusSeconds(31));
+        assertThrows(IllegalStateException.class, () -> productionSnapshots.checkpoint(run, d, 100, stale));
+        productionSnapshots.checkpoint(run, d, 100, proof(d));
+        for (String assignment : List.of("commit_sha='short'", "project_id=gen_random_uuid()", "membership_version=999", "completed_file_count=41", "completed_bytes=2097153", "draft='{}'::jsonb"))
+            assertThrows(DataAccessException.class, () -> db.update("UPDATE project.analysis_repository_checkpoint SET " + assignment + " WHERE analysis_job_id=?", f.job()));
+        var expiredVerifier = new AnalysisSnapshots(db, jobs, tx, Optional.of(sources -> stale));
+        assertThrows(IllegalStateException.class, () -> expiredVerifier.publish(run, productionSnapshots.checkpointDraft(run)));
+        assertEquals("RUNNING", state(f)); assertEquals(0, snapshots(f));
+    }
+
+    @Test void runningLifetimeExpiryBlocksWritesAndCleansCheckpoint() {
+        Fixture f = fixture(1); var run = jobs.claim(f.job()); Draft d = ready(f, run);
+        productionSnapshots.checkpoint(run, d, 100, proof(d));
+        db.update("UPDATE project.analysis_job SET created_at=clock_timestamp()-interval '25 hours' WHERE id=?", f.job());
+        assertThrows(IllegalStateException.class, () -> jobs.heartbeat(run));
+        assertTrue(jobs.expired(100).contains(f.job())); assertTrue(jobs.recover(f.job()));
+        assertEquals("FAILED", state(f));
+        assertEquals("analysis_lifetime_exceeded", db.queryForObject("SELECT failure_code FROM project.analysis_job WHERE id=?", String.class, f.job()));
+        assertEquals(0, number("SELECT count(*) FROM project.analysis_repository_checkpoint WHERE analysis_job_id=?", f.job()));
+    }
+
+    @Test void failuresCountSeparatelyFromExecutionGeneration() {
+        Fixture f = fixture(1);
+        for (int i = 0; i < 4; i++) {
+            var run = jobs.claim(f.job()); jobs.retry(run, "github_rate_limited", 0);
+        }
+        for (int i = 1; i <= settings.maxFailures(); i++) {
+            var run = jobs.claim(f.job()); assertNotNull(run);
+            jobs.retry(run, "github_timeout", 0);
+            assertEquals(i, number("SELECT failure_count FROM project.analysis_job WHERE id=?", f.job()));
+        }
+        assertEquals("FAILED", state(f)); assertNull(jobs.claim(f.job()));
+        assertEquals(7, number("SELECT attempt_count FROM project.analysis_job WHERE id=?", f.job()));
+    }
+
+    @Test void fileReservationsSurviveCrashRejectDuplicatesAndKeepUsage() {
+        Fixture f=fixture(1); var run=jobs.claim(f.job()); Draft d=ready(f,run);
+        var target=jobs.targets(run).getFirst();
+        var entry=new dev.devfield.repoq.project.github.GitHubSourceClient.FileEntry("src/App.java","b".repeat(40),100);
+        var plan=new dev.devfield.repoq.project.github.GitHubSourceClient.Plan(target,"owner/repo",SHA,List.of(entry),Map.of(),2097152);
+        var fileDraft=new Draft(d.members(),d.evidence(),d.topics(),List.of(),List.of(),
+                List.of(new Coverage(d.members().getFirst().id(),1,0,List.of(entry.path()),Map.of())));
+        var files=productionSnapshots.files();
+        files.reserve(run,plan,entry);
+        assertThrows(IllegalStateException.class,()->files.reserve(run,plan,entry));
+        assertEquals(1,number("SELECT download_count FROM project.analysis_job WHERE id=?",f.job()));
+        expire(f); jobs.recover(f.job());
+        db.update("UPDATE project.analysis_job SET next_attempt_at=clock_timestamp() WHERE id=?",f.job());
+        var next=jobs.claim(f.job()); assertNotNull(next);
+        assertThrows(IllegalStateException.class,()->files.collect(run,plan,entry,fileDraft));
+        files.reserve(next,plan,entry); files.collect(next,plan,entry,fileDraft);
+        assertEquals(2,number("SELECT download_count FROM project.analysis_job WHERE id=?",f.job()));
+        assertEquals(200,number("SELECT download_bytes FROM project.analysis_job WHERE id=?",f.job()));
+        assertEquals(1,files.read(next,plan,proof(fileDraft)).size());
+        assertThrows(IllegalStateException.class,()->files.reserve(next,plan,entry));
+        db.update("UPDATE project.analysis_job SET state='CANCELLED' WHERE id=?",f.job());
+        assertEquals(0,number("SELECT count(*) FROM project.analysis_file_progress WHERE analysis_job_id=?",f.job()));
+        assertThrows(IllegalStateException.class,()->files.read(next,plan,proof(fileDraft)));
+        assertEquals(200,number("SELECT download_bytes FROM project.analysis_job WHERE id=?",f.job()));
+    }
+
+    @Test void fileProgressRequiresSameVersionPathAndCurrentAccess() {
+        for(String change:List.of("membership","private","policy","expired","analysis_version")) {
+            Fixture f=fixture(1);var run=jobs.claim(f.job());var d=ready(f,run);
+            var entry=new dev.devfield.repoq.project.github.GitHubSourceClient.FileEntry("src/App.java","b".repeat(40),100);
+            var plan=new dev.devfield.repoq.project.github.GitHubSourceClient.Plan(jobs.targets(run).getFirst(),"owner/repo",SHA,List.of(entry),Map.of(),2097152);
+            var fileDraft=new Draft(d.members(),d.evidence(),d.topics(),List.of(),List.of(),
+                    List.of(new Coverage(d.members().getFirst().id(),1,0,List.of(entry.path()),Map.of())));
+            var files=productionSnapshots.files();files.reserve(run,plan,entry);
+            var e=d.evidence().getFirst();
+            var invalid=evidence(fileDraft,new Evidence(e.id(),e.memberId(),"other.java",1,2,e.claimType(),e.summary()));
+            assertThrows(IllegalArgumentException.class,()->files.collect(run,plan,entry,invalid));
+            files.collect(run,plan,entry,fileDraft);
+            for(String assignment:List.of("project_id=gen_random_uuid()","membership_version=999","blob_sha='invalid'","file_path='../secret'","draft='{}'::jsonb"))
+                assertThrows(DataAccessException.class,()->db.update("UPDATE project.analysis_file_progress SET "+assignment+" WHERE analysis_job_id=?",f.job()));
+            switch(change) {
+                case "membership" -> db.update("UPDATE project.registered_project SET membership_version=membership_version+1 WHERE id=?",f.project());
+                case "private" -> makePrivate(f);
+                case "policy" -> db.update("UPDATE project.analysis_file_progress SET policy_version='old' WHERE analysis_job_id=?",f.job());
+                case "expired" -> db.update("UPDATE project.analysis_file_progress SET created_at=clock_timestamp()-interval '2 hours',expires_at=clock_timestamp()-interval '1 hour' WHERE analysis_job_id=?",f.job());
+                case "analysis_version" -> db.update("UPDATE project.analysis_job SET analysis_version='v2' WHERE id=?",f.job());
+            }
+            assertThrows(RuntimeException.class,()->files.read(run,plan,proof(fileDraft)));
+            assertEquals(0,snapshots(f));
+        }
+    }
+
+    @Test void concurrentFileReservationsHaveOneOwner() throws Exception {
+        Fixture f=fixture(1);var run=jobs.claim(f.job());ready(f,run);
+        var entry=new dev.devfield.repoq.project.github.GitHubSourceClient.FileEntry("src/App.java","b".repeat(40),100);
+        var plan=new dev.devfield.repoq.project.github.GitHubSourceClient.Plan(jobs.targets(run).getFirst(),"owner/repo",SHA,List.of(entry),Map.of(),2097152);
+        var start=new java.util.concurrent.CountDownLatch(1);
+        try(var pool=java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            java.util.concurrent.Callable<Boolean> reserve=()->{start.await();try {
+                productionSnapshots.files().reserve(run,plan,entry);return true;
+            } catch(IllegalStateException stale) {return false;}};
+            var first=pool.submit(reserve);var second=pool.submit(reserve);start.countDown();
+            assertNotEquals(first.get(5,java.util.concurrent.TimeUnit.SECONDS),second.get(5,java.util.concurrent.TimeUnit.SECONDS));
+        }
+        assertEquals(1,number("SELECT download_count FROM project.analysis_job WHERE id=?",f.job()));
+        assertEquals(1,number("SELECT count(*) FROM project.analysis_file_progress WHERE analysis_job_id=?",f.job()));
+    }
+
+    @Test void fileReservationAndLedgerRollbackTogether() {
+        Fixture f=fixture(1); var run=jobs.claim(f.job()); ready(f,run);
+        var entry=new dev.devfield.repoq.project.github.GitHubSourceClient.FileEntry("src/App.java","b".repeat(40),100);
+        var plan=new dev.devfield.repoq.project.github.GitHubSourceClient.Plan(jobs.targets(run).getFirst(),"owner/repo",SHA,List.of(entry),Map.of(),2097152);
+        assertThrows(IllegalStateException.class,()->tx.executeWithoutResult(status->{
+            productionSnapshots.files().reserve(run,plan,entry); throw new IllegalStateException("rollback");
+        }));
+        assertEquals(0,number("SELECT download_count FROM project.analysis_job WHERE id=?",f.job()));
+        assertEquals(0,number("SELECT count(*) FROM project.analysis_file_progress WHERE analysis_job_id=?",f.job()));
     }
 
     private UUID insertEnvelope(Fixture f) {
