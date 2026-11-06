@@ -179,7 +179,7 @@ public class Projects {
             throw new ApiProblem(HttpStatus.BAD_REQUEST, "invalid_repositories");
         boolean blocked = privateMembers(owner, projectId).stream().anyMatch(m -> !accessible(owner, m));
         if (hasRunningJob(projectId)) throw conflict("analysis_in_progress");
-        // A-stage QUEUED jobs have no worker. Replace one atomically so adding to a new project works.
+        // Replace a queued job under the same fences used by the worker's claim.
         cancelQueuedJob(projectId);
         try {
             insertMembers(projectId, owner, repositories);
@@ -210,7 +210,7 @@ public class Projects {
         int count = db.queryForObject("SELECT count(*) FROM project.project_repository " +
                 "WHERE project_id=? AND removed_at IS NULL", Integer.class, projectId);
         if (count <= 1) throw conflict("last_repository_required");
-        // A-stage has no worker cancellation handshake; refuse removal while one is running.
+        // Public membership changes retain the RUNNING conflict policy; private revocation can cancel.
         if (hasRunningJob(projectId) && !removingPrivate) throw conflict("analysis_in_progress");
         if (removingPrivate) cancelActiveJobs(projectId); else cancelQueuedJob(projectId);
         db.update("UPDATE project.project_repository SET removed_at=now() WHERE id=?", memberId);
@@ -432,28 +432,9 @@ public class Projects {
         }
     }
 
-    private void lockUser(UUID owner) {
-        db.update("INSERT INTO project.project_write_fence(id,scope,owner_user_id,state) " +
-                        "VALUES (?,'USER',?,'ACTIVE') ON CONFLICT (owner_user_id) WHERE scope='USER' DO NOTHING",
-                UUID.randomUUID(), owner);
-        String state = db.queryForObject("SELECT state FROM project.project_write_fence " +
-                "WHERE scope='USER' AND owner_user_id=? FOR UPDATE", String.class, owner);
-        if (!"ACTIVE".equals(state)) throw new ApiProblem(HttpStatus.FORBIDDEN, "account_unavailable");
-    }
+    private void lockUser(UUID owner) { ProjectWriteFence.lockUser(db, owner); }
 
-    private long lockProject(UUID owner, UUID id) {
-        var fence = db.query("SELECT state FROM project.project_write_fence " +
-                        "WHERE scope='PROJECT' AND owner_user_id=? AND project_id=? FOR UPDATE",
-                (rs, row) -> rs.getString(1), owner, id);
-        if (fence.isEmpty()) throw new ApiProblem(HttpStatus.NOT_FOUND, "project_not_found");
-        if (!"ACTIVE".equals(fence.getFirst())) throw conflict("project_unavailable");
-        var projects = db.query("SELECT membership_version,state FROM project.registered_project " +
-                        "WHERE id=? AND owner_user_id=? FOR UPDATE",
-                (rs, row) -> new Object[]{rs.getLong(1), rs.getString(2)}, id, owner);
-        if (projects.isEmpty()) throw new ApiProblem(HttpStatus.NOT_FOUND, "project_not_found");
-        if (!"ACTIVE".equals(projects.getFirst()[1])) throw conflict("project_unavailable");
-        return (Long) projects.getFirst()[0];
-    }
+    private long lockProject(UUID owner, UUID id) { return ProjectWriteFence.lockProject(db, owner, id); }
 
     private boolean hasRunningJob(UUID projectId) {
         return Boolean.TRUE.equals(db.queryForObject("SELECT EXISTS (SELECT 1 FROM project.analysis_job " +

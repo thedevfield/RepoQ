@@ -1,0 +1,489 @@
+package dev.devfield.repoq.project.analysis;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import dev.devfield.repoq.project.data.Projects;
+import dev.devfield.repoq.project.github.GitHubRepositoryClient;
+import dev.devfield.repoq.project.github.GitHubSourceClient;
+import dev.devfield.repoq.project.security.AuthSessionVerifier;
+import java.net.*;
+import java.net.http.*;
+import java.time.*;
+import java.util.*;
+import java.util.concurrent.*;
+import org.junit.jupiter.api.*;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.security.oauth2.jwt.JwtDecoder;
+import org.springframework.test.context.TestPropertySource;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
+
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@TestPropertySource(properties = {
+        "devfield.project.auth.issuer=test-issuer", "devfield.project.auth.audience=test-audience",
+        "devfield.project.auth.jwks-uri=http://127.0.0.1:1/api/auth/jwks",
+        "devfield.project.auth.session-check-uri=http://127.0.0.1:1/internal/auth/session-check",
+        "devfield.project.auth.service-key=test-service-key"
+})
+class PublicAnalysisIntegrationTest {
+    @Autowired JdbcTemplate db;
+    @Autowired Projects projects;
+    @Autowired AnalysisJobs jobs;
+    @Autowired AnalysisSnapshots snapshots;
+    @Autowired AnalysisSettings settings;
+    @Autowired StaticEvidenceAnalyzer analyzer;
+    @MockitoBean PublicAccessVerifier verifier;
+    @MockitoBean JwtDecoder decoder;
+    @MockitoBean AuthSessionVerifier sessions;
+    @Value("\u0024{local.server.port}") int port;
+    MockSourceServer server;
+    GitHubSourceClient client;
+    AnalysisWorker worker;
+    UUID owner;
+    final ObjectMapper json = new ObjectMapper();
+    record Fixture(UUID project, UUID job) {}
+
+    @BeforeEach void setup() throws Exception {
+        owner = UUID.randomUUID(); server = new MockSourceServer(); client = server.client();
+        worker = new AnalysisWorker(settings, jobs, snapshots, Optional.of(client), analyzer);
+        when(verifier.verify(anyList())).thenAnswer(call -> client.verify(call.getArgument(0)));
+        when(decoder.decode(anyString())).thenAnswer(call -> new Jwt(call.getArgument(0), Instant.now().minusSeconds(10),
+                Instant.now().plusSeconds(300), Map.of("alg", "RS256"),
+                Map.of("sub", "other".equals(call.getArgument(0)) ? UUID.randomUUID().toString() : owner.toString())));
+    }
+    @AfterEach void cleanup() {
+        worker.stop(); server.close();
+        db.update("UPDATE project.registered_project SET latest_ready_snapshot_id=NULL WHERE owner_user_id=?", owner);
+        for (String table : List.of("available_topic", "evidence_reference", "snapshot_member"))
+            db.update("DELETE FROM project." + table + " WHERE snapshot_id IN (SELECT s.id FROM project.analysis_snapshot s " +
+                    "JOIN project.registered_project p ON p.id=s.project_id WHERE p.owner_user_id=?)", owner);
+        db.update("DELETE FROM project.analysis_snapshot WHERE project_id IN (SELECT id FROM project.registered_project WHERE owner_user_id=?)", owner);
+        db.update("DELETE FROM project.analysis_job WHERE project_id IN (SELECT id FROM project.registered_project WHERE owner_user_id=?)", owner);
+        db.update("DELETE FROM project.project_repository WHERE owner_user_id=?", owner);
+        db.update("DELETE FROM project.project_write_fence WHERE owner_user_id=?", owner);
+        db.update("DELETE FROM project.registered_project WHERE owner_user_id=?", owner);
+        db.update("DELETE FROM project.github_connection WHERE devfield_user_id=?", owner);
+    }
+    Fixture fixture(int count) {
+        List<GitHubRepositoryClient.Repository> repos = new ArrayList<>();
+        for (int i = 0; i < count; i++) {
+            var repo = server.add(Integer.toString(42 + i));
+            repos.add(new GitHubRepositoryClient.Repository(repo.id, repo.name, "fixture"));
+        }
+        var registration = projects.register(owner, repos, "Public fixture", null, null);
+        return new Fixture(registration.id(), db.queryForObject("SELECT id FROM project.analysis_job WHERE project_id=?", UUID.class, registration.id()));
+    }
+    String state(Fixture f) { return db.queryForObject("SELECT state FROM project.analysis_job WHERE id=?", String.class, f.job()); }
+    JsonNode get(String path) throws Exception {
+        var response = call(path, "owner"); assertEquals(200, response.statusCode()); return json.readTree(response.body());
+    }
+    HttpResponse<String> call(String path, String token) throws Exception {
+        return HttpClient.newHttpClient().send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + path))
+                .header("Authorization", "Bearer " + token).GET().build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    @ParameterizedTest @ValueSource(ints = {1, 2})
+    void singleAndMultipleReadyAndOwnedHttpViews(int count) throws Exception {
+        Fixture f = fixture(count);
+        assertTrue(worker.runJob(f.job())); assertEquals("READY", state(f));
+        JsonNode detail = get("/api/projects/" + f.project());
+        assertEquals("READY", detail.path("analysisStatus").asText());
+        var snapshot = detail.path("latestReadySnapshot");
+        assertEquals(count, snapshot.path("members").size());
+        assertFalse(snapshot.path("evidenceReferences").isEmpty());
+        assertEquals(MockSourceServer.SHA, snapshot.path("members").get(0).path("commitSha").asText());
+        assertFalse(detail.path("canInterview").asBoolean()); assertFalse(detail.path("canPrivateInterview").asBoolean());
+        int calls = server.paths.size();
+        assertEquals(404, call("/api/projects/" + f.project(), "other").statusCode());
+        assertEquals(calls, server.paths.size());
+        assertTrue(get("/api/projects").toString().contains("READY"));
+        assertEquals(0, server.authorizationHeaders.get());
+    }
+
+    @Test void privateTransitionAndOutageHideSnapshotAndSha() throws Exception {
+        Fixture f = fixture(1); worker.runJob(f.job()); assertEquals("READY", state(f));
+        server.repos.get("42").privateRepo = true;
+        JsonNode blocked = get("/api/projects/" + f.project());
+        assertTrue(blocked.path("latestReadySnapshot").isNull());
+        assertTrue(blocked.path("repositories").get(0).path("commitSha").isNull());
+        assertEquals("BLOCKED", blocked.path("repositories").get(0).path("accessStatus").asText());
+        assertEquals("FAILED", blocked.path("analysisStatus").asText());
+        server.repos.get("42").privateRepo = false; server.allStatus = 500;
+        assertTrue(get("/api/projects/" + f.project()).path("latestReadySnapshot").isNull());
+        assertEquals(1, db.queryForObject("SELECT count(*) FROM project.analysis_snapshot WHERE project_id=?", Integer.class, f.project()));
+    }
+    @ParameterizedTest @ValueSource(strings={
+            "class Example<HttpClient> { HttpClient value; }",
+            "class Parent { static class HttpClient {} } class Child extends Parent { HttpClient value; }"})
+    void shadowingOnlyIsInsufficientRatherThanReady(String declaration) {
+        Fixture f = fixture(1);
+        var repo = server.repos.get("42");
+        repo.files.clear();
+        repo.files.put("src/Example.java", "import java.net.http.HttpClient; " + declaration);
+        worker.runJob(f.job());
+        assertEquals("INSUFFICIENT_EVIDENCE", state(f));
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM project.analysis_snapshot WHERE project_id=?", Integer.class, f.project()));
+    }
+
+    @ParameterizedTest @ValueSource(ints = {0, 40, 60})
+    void fiveRepositoriesReservePublicationAndShareRemainingQuota(int advertisedRemaining) throws Exception {
+        Fixture f = fixture(5);
+        boolean pinned = advertisedRemaining == 60;
+        if (pinned) db.update("UPDATE project.analysis_job SET repository_progress=(SELECT jsonb_agg(" +
+                "jsonb_set(p,'{commitSha}',to_jsonb(?::text))) FROM jsonb_array_elements(repository_progress) p) WHERE id=?",
+                MockSourceServer.SHA, f.job());
+        for (var repo : server.repos.values()) {
+            repo.files.clear();
+            for (int i = 0; i < 8; i++) repo.files.put("src/App" + i + ".java", MockSourceServer.JAVA);
+        }
+        if (advertisedRemaining == 40) server.headers.put("X-RateLimit-Remaining", "40");
+        worker.runJob(f.job());
+        assertEquals("READY", state(f));
+        assertTrue(server.paths.size() <= 60);
+        assertEquals(pinned ? 30 : advertisedRemaining == 0 ? 25 : 6, server.contentRequests.get());
+        assertTrue(server.paths.subList(server.paths.size() - 5, server.paths.size()).stream().allMatch(p -> p.startsWith("/repositories/")));
+        if (pinned) assertTrue(server.paths.stream().noneMatch(p -> p.contains("/git/ref/")));
+        var coverage = json.readTree(db.queryForObject("SELECT coverage::text FROM project.analysis_snapshot WHERE project_id=?", String.class, f.project()));
+        int min = 40, max = 0;
+        for (JsonNode entry : coverage) {
+            int count = entry.path("collectedFiles").intValue();
+            min = Math.min(min, count); max = Math.max(max, count);
+            assertTrue(entry.path("exclusions").has("api_budget"));
+        }
+        assertTrue(min > 0); assertTrue(max - min <= 1);
+        assertEquals(0, server.authorizationHeaders.get());
+        assertFalse(worker.runJob(f.job()));
+        assertEquals(1, db.queryForObject("SELECT count(*) FROM project.analysis_snapshot WHERE project_id=?", Integer.class, f.project()));
+    }
+
+    @ParameterizedTest @CsvSource({"60,0", "60,90000", "20,0"})
+    void twentyRepositoriesResumeAcrossWindowsWithoutDownloadingCompletedBlobs(int requestLimit, int padding) throws Exception {
+        Fixture f = fixture(20);
+        worker = new AnalysisWorker(new AnalysisSettings(false, 3, 60, 300, requestLimit), jobs, snapshots, Optional.of(client), analyzer);
+        for (var repo : server.repos.values()) {
+            repo.files.clear();
+            for (int i = 0; i < 8; i++) repo.files.put("src/App" + i + ".java", MockSourceServer.JAVA + " ".repeat(padding));
+        }
+        int windows = 0;
+        Set<String> completedBlobPaths = new HashSet<>();
+        while (!"READY".equals(state(f)) && windows++ < 12) {
+            int start = server.paths.size();
+            worker.runJob(f.job());
+            List<String> paths = List.copyOf(server.paths.subList(start, server.paths.size()));
+            assertTrue(paths.size() <= requestLimit);
+            Set<String> thisWindow = new HashSet<>(paths.stream().filter(p -> p.contains("/git/blobs/")).toList());
+            assertTrue(Collections.disjoint(completedBlobPaths, thisWindow));
+            completedBlobPaths.addAll(thisWindow);
+            assertEquals(0, db.queryForObject("SELECT failure_count FROM project.analysis_job WHERE id=?", Integer.class, f.job()));
+            if (!"READY".equals(state(f))) {
+                assertEquals("QUEUED", state(f));
+                assertTrue(db.queryForObject("SELECT count(*) FROM project.analysis_repository_checkpoint WHERE analysis_job_id=?", Integer.class, f.job()) > 0);
+                assertTrue(db.queryForObject("SELECT sum(completed_bytes)<=2097152 AND sum(completed_file_count)<=40 FROM project.analysis_repository_checkpoint WHERE analysis_job_id=?", Boolean.class, f.job()));
+                server.resetWindow();
+                db.update("UPDATE project.analysis_job SET next_attempt_at=clock_timestamp() WHERE id=?", f.job());
+                // A new worker instance must use persisted results, not in-memory collected files.
+                worker = new AnalysisWorker(new AnalysisSettings(false, 3, 60, 300, requestLimit), jobs, snapshots, Optional.of(client), analyzer);
+            }
+        }
+        assertEquals("READY", state(f)); assertTrue(windows > 1);
+        assertTrue(server.contentRequests.get() <= 40);
+        assertEquals(20, completedBlobPaths.size());
+        assertTrue(server.paths.subList(server.paths.size() - 20, server.paths.size()).stream().allMatch(p -> p.startsWith("/repositories/")));
+        assertEquals(20, db.queryForObject("SELECT count(*) FROM project.snapshot_member WHERE project_id=?", Integer.class, f.project()));
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM project.analysis_repository_checkpoint WHERE analysis_job_id=?", Integer.class, f.job()));
+        assertFalse(worker.runJob(f.job()));
+        assertEquals(0, server.authorizationHeaders.get());
+    }
+
+    @Test void checkpointPublicToPrivateTransitionBlocksReuseAndDeletesResults() {
+        Fixture f = fixture(1);
+        server.beforeBlob = () -> { server.allStatus = 429; server.headers.put("Retry-After", "120"); };
+        worker.runJob(f.job()); assertEquals("QUEUED", state(f));
+        assertEquals(1, db.queryForObject("SELECT count(*) FROM project.analysis_file_progress WHERE analysis_job_id=?", Integer.class, f.job()));
+        int blobs = server.contentRequests.get();
+        server.allStatus = 0; server.beforeBlob = () -> {}; server.repos.get("42").privateRepo = true;
+        server.resetWindow();
+        db.update("UPDATE project.analysis_job SET next_attempt_at=clock_timestamp() WHERE id=?", f.job());
+        worker.runJob(f.job()); assertEquals("FAILED", state(f));
+        assertEquals(blobs, server.contentRequests.get());
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM project.analysis_repository_checkpoint WHERE analysis_job_id=?", Integer.class, f.job()));
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM project.analysis_snapshot WHERE project_id=?", Integer.class, f.project()));
+    }
+
+    @Test void fourHttpRateLimitWindowsResumeWithoutSpendingFailureBudget() {
+        Fixture f = fixture(1);
+        server.allStatus = 429;
+        for (int i = 0; i < 4; i++) {
+            server.headers.put("Retry-After", "120");
+            worker.runJob(f.job()); assertEquals("QUEUED", state(f));
+            assertEquals(0, db.queryForObject("SELECT failure_count FROM project.analysis_job WHERE id=?", Integer.class, f.job()));
+            server.resetWindow();
+            db.update("UPDATE project.analysis_job SET next_attempt_at=clock_timestamp() WHERE id=?", f.job());
+        }
+        server.allStatus = 0;
+        worker.runJob(f.job()); assertEquals("READY", state(f));
+        assertEquals(5, db.queryForObject("SELECT attempt_count FROM project.analysis_job WHERE id=?", Integer.class, f.job()));
+    }
+
+    @Test void repeatedRateWaitDoesNotSpendFailuresAndLifetimeStopsWaiting() {
+        Fixture f = fixture(1);
+        for (int i = 0; i < 5; i++) {
+            var run = jobs.claim(f.job()); assertNotNull(run);
+            jobs.retry(run, "github_rate_limited", 60);
+            assertEquals(0, db.queryForObject("SELECT failure_count FROM project.analysis_job WHERE id=?", Integer.class, f.job()));
+            db.update("UPDATE project.analysis_job SET next_attempt_at=clock_timestamp() WHERE id=?", f.job());
+        }
+        worker.runJob(f.job()); assertEquals("READY", state(f));
+        Fixture expired = fixtureWithOtherIds();
+        db.update("UPDATE project.analysis_job SET created_at=clock_timestamp()-interval '25 hours' WHERE id=?", expired.job());
+        assertFalse(worker.runJob(expired.job())); assertEquals("FAILED", state(expired));
+        assertEquals("analysis_lifetime_exceeded", db.queryForObject("SELECT failure_code FROM project.analysis_job WHERE id=?", String.class, expired.job()));
+    }
+
+    Fixture fixtureWithOtherIds() {
+        var repo = server.add("9999");
+        var project = projects.register(owner, List.of(new GitHubRepositoryClient.Repository(repo.id, repo.name, "fixture")), "Another", null, null);
+        return new Fixture(project.id(), db.queryForObject("SELECT id FROM project.analysis_job WHERE project_id=?", UUID.class, project.id()));
+    }
+
+    @Test void filePipelinePreservesValidatedResult() {
+        Fixture f=fixture(1);var run=jobs.claim(f.job());var target=jobs.targets(run).getFirst();
+        var budget=new GitHubSourceClient.Budget(60,()->jobs.heartbeat(run));
+        var plan=client.prepare(target,40,2097152,budget,sha->jobs.progress(run,new AnalysisJobs.Progress(target.repositoryId(),"RUNNING",sha,null)));
+        var access=client.openCollection(plan,budget);
+        snapshots.files().read(run,plan,access.proof());
+        var fitted=client.fitPlans(List.of(plan),budget,1).getFirst();
+        var entry=fitted.files().getFirst();
+        var download=client.download(access,entry,budget,()->snapshots.files().reserve(run,plan,entry));
+        var draft=analyzer.analyze(List.of(new GitHubSourceClient.Collected(target,plan.commitSha(),List.of(download.file()),Map.of())));
+        snapshots.files().collect(run,plan,entry,draft);
+        var proof=client.checkpointProof(plan,budget);
+        var result=snapshots.files().merge(run,plan,Map.of(),proof);
+        snapshots.checkpoint(run,result.draft(),result.bytes(),proof);
+        snapshots.publish(run);assertEquals("READY",state(f));
+    }
+
+    @Test void thirtyDownloadedFilesSurviveRateLimitWithoutRedownload() {
+        Fixture f = fixture(1); var repo = server.repos.get("42"); repo.files.clear();
+        for (int i = 0; i < 40; i++) repo.files.put("src/App" + i + ".java", MockSourceServer.JAVA + " ".repeat(49000));
+        server.beforeBlob = () -> { if (server.contentRequests.get() == 30) server.headers.put("X-RateLimit-Remaining", "0"); };
+        worker.runJob(f.job()); assertEquals("QUEUED", state(f)); assertEquals(30, server.contentRequests.get());
+        server.resetWindow(); server.beforeBlob = () -> {};
+        db.update("UPDATE project.analysis_job SET next_attempt_at=clock_timestamp() WHERE id=?", f.job());
+        worker.runJob(f.job()); assertEquals("READY", state(f)); assertEquals(40, server.contentRequests.get());
+        assertEquals(40,db.queryForObject("SELECT download_count FROM project.analysis_job WHERE id=?",Integer.class,f.job()));
+        assertTrue(db.queryForObject("SELECT download_bytes<=2097152 FROM project.analysis_job WHERE id=?",Boolean.class,f.job()));
+    }
+
+    @Test void resumedLargeBodiesRemainWithinCumulativeByteCeiling() {
+        Fixture f=fixture(1);var repo=server.repos.get("42");repo.files.clear();
+        for(int i=0;i<40;i++) repo.files.put("src/Large"+i+".java",MockSourceServer.JAVA+" ".repeat(90000));
+        server.beforeBlob=()->{if(server.contentRequests.get()==15)server.headers.put("X-RateLimit-Remaining","0");};
+        worker.runJob(f.job());assertEquals("QUEUED",state(f));assertEquals(15,server.contentRequests.get());
+        server.resetWindow();server.beforeBlob=()->{};
+        db.update("UPDATE project.analysis_job SET next_attempt_at=clock_timestamp() WHERE id=?",f.job());
+        worker.runJob(f.job());assertEquals("READY",state(f));
+        int count=server.contentRequests.get();assertEquals(23,count);
+        assertEquals(count,db.queryForObject("SELECT download_count FROM project.analysis_job WHERE id=?",Integer.class,f.job()));
+        assertEquals(count*(90000+MockSourceServer.JAVA.getBytes(java.nio.charset.StandardCharsets.UTF_8).length),
+                db.queryForObject("SELECT download_bytes FROM project.analysis_job WHERE id=?",Integer.class,f.job()));
+        assertTrue(count*(90000+MockSourceServer.JAVA.length())<=2097152);
+    }
+
+    @Test void checkpointRefreshRateWaitKeepsSealedFilesWithoutRedownload() {
+        Fixture f=fixture(1);
+        server.beforeMetadata=()->{ if(server.contentRequests.get()>0) {server.allStatus=429;server.headers.put("Retry-After","60");} };
+        worker.runJob(f.job()); assertEquals("QUEUED",state(f));
+        assertEquals(0,db.queryForObject("SELECT failure_count FROM project.analysis_job WHERE id=?",Integer.class,f.job()));
+        assertEquals(1,db.queryForObject("SELECT count(*) FROM project.analysis_file_progress WHERE analysis_job_id=?",Integer.class,f.job()));
+        server.beforeMetadata=()->{};server.allStatus=0;server.resetWindow();
+        db.update("UPDATE project.analysis_job SET next_attempt_at=clock_timestamp() WHERE id=?",f.job());
+        worker.runJob(f.job());assertEquals("READY",state(f));assertEquals(1,server.contentRequests.get());
+    }
+
+    @Test void checkpointRefreshPrivateCancelAndExpiredLeaseCannotPublish() {
+        for(String change:List.of("private","cancel","lease")) {
+            Fixture f=fixtureWithOtherIds(); var repo=server.repos.get("9999");
+            int before=server.contentRequests.get();
+            server.beforeMetadata=()->{if(server.contentRequests.get()>before) {
+                switch(change) {
+                    case "private" -> repo.privateRepo=true;
+                    case "cancel" -> db.update("UPDATE project.analysis_job SET state='CANCELLED' WHERE id=?",f.job());
+                    case "lease" -> db.update("UPDATE project.analysis_job SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=?",f.job());
+                }
+            }};
+            worker.runJob(f.job());
+            assertNotEquals("READY",state(f));
+            assertEquals(0,db.queryForObject("SELECT count(*) FROM project.analysis_snapshot WHERE project_id=?",Integer.class,f.project()));
+            assertEquals(0,db.queryForObject("SELECT count(*) FROM project.analysis_repository_checkpoint WHERE analysis_job_id=?",Integer.class,f.job()));
+            server.beforeMetadata=()->{};
+            // Remove this isolated fixture before reusing its GitHub ID.
+            db.update("DELETE FROM project.analysis_job WHERE id=?",f.job());
+            db.update("DELETE FROM project.project_repository WHERE project_id=?",f.project());
+            db.update("DELETE FROM project.registered_project WHERE id=?",f.project());
+        }
+    }
+
+    @ParameterizedTest @ValueSource(ints={46,47,48})
+    void slowCollectionRequestBoundaryPreservesProgress(int limit) {
+        Fixture f=fixture(1);var repo=server.repos.get("42");repo.files.clear();
+        for(int i=0;i<40;i++)repo.files.put("src/App"+i+".java",MockSourceServer.JAVA+" // file "+i);
+        worker=new AnalysisWorker(new AnalysisSettings(false,3,60,300,limit),jobs,snapshots,Optional.of(client),analyzer);
+        server.beforeBlob=()->{try{Thread.sleep(800);}catch(InterruptedException e){Thread.currentThread().interrupt();}};
+        worker.runJob(f.job());
+        assertTrue(server.paths.size()<=limit);
+        assertEquals(0,db.queryForObject("SELECT failure_count FROM project.analysis_job WHERE id=?",Integer.class,f.job()));
+        if(limit<48) {
+            assertEquals("QUEUED",state(f));
+            int completed=server.contentRequests.get();
+            assertTrue(completed>0 && completed<40);
+            assertEquals(completed,db.queryForObject("SELECT count(*) FROM project.analysis_file_progress WHERE analysis_job_id=? AND state='COLLECTED'",Integer.class,f.job()));
+            assertEquals("analysis_window_complete",db.queryForObject("SELECT failure_code FROM project.analysis_job WHERE id=?",String.class,f.job()));
+            assertTrue(db.queryForObject("SELECT next_attempt_at>clock_timestamp() FROM project.analysis_job WHERE id=?",Boolean.class,f.job()));
+            var previous=List.copyOf(server.paths);server.beforeBlob=()->{};
+            db.update("UPDATE project.analysis_job SET next_attempt_at=clock_timestamp() WHERE id=?",f.job());
+            worker=new AnalysisWorker(new AnalysisSettings(false,3,60,300,limit),jobs,snapshots,Optional.of(client),analyzer);
+            worker.runJob(f.job());
+            assertTrue(java.util.Collections.disjoint(previous.stream().filter(p->p.contains("/git/blobs/")).toList(),
+                server.paths.subList(previous.size(),server.paths.size()).stream().filter(p->p.contains("/git/blobs/")).toList()));
+        }
+        assertEquals("READY",state(f));assertEquals(40,server.contentRequests.get());
+        assertEquals(0,db.queryForObject("SELECT failure_count FROM project.analysis_job WHERE id=?",Integer.class,f.job()));
+        assertTrue(db.queryForObject("SELECT download_count=40 AND download_bytes<=2097152 FROM project.analysis_job WHERE id=?",Boolean.class,f.job()));
+    }
+
+    @Test void fortySlowFilesRefreshPublicProofBeforeCheckpoint() {
+        Fixture f = fixture(1); var repo = server.repos.get("42"); repo.files.clear();
+        for (int i = 0; i < 40; i++) repo.files.put("src/App" + i + ".java", MockSourceServer.JAVA);
+        server.beforeBlob = () -> {
+            try { Thread.sleep(800); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        };
+        worker.runJob(f.job()); assertEquals("READY", state(f)); assertEquals(40, server.contentRequests.get());
+        assertTrue(server.paths.stream().filter(p -> p.equals("/repositories/42")).count() >= 5);
+    }
+
+    @Test void quotaConsumedDuringCollectionWaitsWithoutClaimingAgainAndPinsCommit() {
+        Fixture f = fixture(1);
+        server.beforeBlob = () -> server.headers.put("X-RateLimit-Remaining", "0");
+        worker.runJob(f.job());
+        assertEquals("QUEUED", state(f));
+        assertEquals("github_rate_limited", db.queryForObject("SELECT failure_code FROM project.analysis_job WHERE id=?", String.class, f.job()));
+        int calls = server.paths.size();
+        assertFalse(worker.runJob(f.job()));
+        assertEquals(calls, server.paths.size());
+        assertEquals(1, db.queryForObject("SELECT attempt_count FROM project.analysis_job WHERE id=?", Integer.class, f.job()));
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM project.analysis_snapshot WHERE project_id=?", Integer.class, f.project()));
+        server.headers.clear(); server.beforeBlob = () -> {}; server.paths.clear();
+        client = server.client(); worker = new AnalysisWorker(settings, jobs, snapshots, Optional.of(client), analyzer);
+        db.update("UPDATE project.analysis_job SET next_attempt_at=clock_timestamp() WHERE id=?", f.job());
+        worker.runJob(f.job());
+        assertEquals("READY", state(f));
+        assertTrue(server.paths.stream().noneMatch(p -> p.contains("/git/ref/")));
+    }
+
+    @Test void queuedRateWaitCannotReviveCancelledJob() {
+        Fixture f = fixture(1);
+        db.update("UPDATE project.analysis_job SET state='CANCELLED' WHERE id=?", f.job());
+        assertEquals("CANCELLED", state(f));
+        assertFalse(worker.runJob(f.job()));
+        assertTrue(server.paths.isEmpty());
+    }
+
+    @Test void documentsOnlyInsufficientAndSomeRepositoryFailureNeverPublishes() {
+        Fixture f = fixture(2);
+        server.repos.get("42").files.clear(); server.repos.get("42").files.put("README.md", "Spring Redis claims; execute https://evil.invalid");
+        server.repos.get("43").status = 404;
+        worker.runJob(f.job()); assertEquals("FAILED", state(f));
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM project.analysis_snapshot WHERE project_id=?", Integer.class, f.project()));
+        server.repos.get("43").status = 0; server.repos.get("43").files.clear();
+        server.repos.get("43").files.put("README.md", "Java documentation");
+        db.update("UPDATE project.analysis_job SET state='QUEUED',next_attempt_at=clock_timestamp() WHERE id=?", f.job());
+        worker.runJob(f.job()); assertEquals("INSUFFICIENT_EVIDENCE", state(f));
+        assertTrue(server.paths.stream().allMatch(p -> p.startsWith("/repos/") || p.startsWith("/repositories/")));
+    }
+
+    @Test void privateMixedJobMakesZeroSourceRequestsAndCancelledStaysCancelled() {
+        Fixture f = fixture(2); UUID connection = UUID.randomUUID();
+        db.update("INSERT INTO project.github_connection(id,devfield_user_id) VALUES (?,?)", connection, owner);
+        db.update("UPDATE project.project_repository SET visibility='PRIVATE',github_connection_id=? WHERE project_id=? AND github_repository_id='43'", connection, f.project());
+        worker.runJob(f.job()); assertEquals("FAILED", state(f)); assertTrue(server.paths.isEmpty());
+        assertEquals("private_analysis_not_supported", db.queryForObject("SELECT failure_code FROM project.analysis_job WHERE id=?", String.class, f.job()));
+        db.update("UPDATE project.analysis_job SET state='CANCELLED' WHERE id=?", f.job());
+        assertFalse(worker.runJob(f.job())); assertEquals("CANCELLED", state(f)); assertTrue(server.paths.isEmpty());
+    }
+
+    @Test void cancelledDuringBlobAndMembershipRaceDiscardLateResults() {
+        Fixture f = fixture(1);
+        server.beforeBlob = () -> db.update("UPDATE project.analysis_job SET state='CANCELLED' WHERE id=?", f.job());
+        worker.runJob(f.job()); assertEquals("CANCELLED", state(f));
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM project.analysis_snapshot WHERE project_id=?", Integer.class, f.project()));
+        db.update("UPDATE project.analysis_job SET state='QUEUED' WHERE id=?", f.job());
+        server.beforeBlob = () -> db.update("UPDATE project.registered_project SET membership_version=membership_version+1 WHERE id=?", f.project());
+        worker.runJob(f.job());
+        assertNotEquals("READY", state(f));
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM project.analysis_snapshot WHERE project_id=?", Integer.class, f.project()));
+    }
+
+    @Test void rateLimitRetryUsesSameJobAndPinnedSha() {
+        Fixture f = fixture(1);
+        server.beforeBlob = () -> { server.allStatus = 429; server.headers.put("Retry-After", "120"); };
+        worker.runJob(f.job()); assertEquals("QUEUED", state(f));
+        assertEquals(1, db.queryForObject("SELECT count(*) FROM project.analysis_job WHERE project_id=?", Integer.class, f.project()));
+        assertTrue(db.queryForObject("SELECT next_attempt_at>clock_timestamp()+interval '100 seconds' FROM project.analysis_job WHERE id=?", Boolean.class, f.job()));
+        assertEquals(MockSourceServer.SHA, db.queryForObject("SELECT repository_progress->0->>'commitSha' FROM project.analysis_job WHERE id=?", String.class, f.job()));
+        server.allStatus = 0; server.headers.clear(); server.beforeBlob = () -> {}; server.paths.clear();
+        server.repos.get("42").head = "f".repeat(40);
+        client = server.client(); worker = new AnalysisWorker(settings, jobs, snapshots, Optional.of(client), analyzer);
+        db.update("UPDATE project.analysis_job SET next_attempt_at=clock_timestamp() WHERE id=?", f.job());
+        worker.runJob(f.job()); assertEquals("READY", state(f));
+        assertTrue(server.paths.stream().noneMatch(p -> p.contains("/git/ref/")));
+    }
+
+    @Test void fairFileAndTotalByteBudgetsAcrossRepositories() {
+        Fixture f = fixture(2);
+        for (var repo : server.repos.values()) {
+            repo.files.clear();
+            for (int i = 0; i < 25; i++) repo.files.put("src/App" + i + ".java", MockSourceServer.JAVA + " ".repeat(90000));
+        }
+        worker.runJob(f.job()); assertEquals("READY", state(f));
+        String coverage = db.queryForObject("SELECT coverage::text FROM project.analysis_snapshot WHERE project_id=?", String.class, f.project());
+        assertTrue(coverage.contains("byte_budget"));
+        assertEquals(2, db.queryForObject("SELECT count(*) FROM project.snapshot_member WHERE project_id=?", Integer.class, f.project()));
+        assertTrue(server.contentRequests.get() <= 40);
+    }
+
+    @Test void executorHasOneSlotAndNoBacklog() throws Exception {
+        Fixture f = fixture(1); CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
+        server.beforeBlob = () -> {
+            entered.countDown();
+            try { assertTrue(release.await(10, TimeUnit.SECONDS)); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        };
+        worker = new AnalysisWorker(new AnalysisSettings(true, 3, 60, 300), jobs, snapshots, Optional.of(client), analyzer);
+        worker.start();
+        try {
+            worker.poll(); assertTrue(entered.await(10, TimeUnit.SECONDS));
+            for (int i = 0; i < 10; i++) worker.poll();
+            assertEquals(1, db.queryForObject("SELECT attempt_count FROM project.analysis_job WHERE id=?", Integer.class, f.job()));
+            release.countDown();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (!state(f).equals("READY") && System.nanoTime() < deadline) Thread.sleep(20);
+            assertEquals("READY", state(f)); assertEquals(1, server.contentRequests.get());
+        } finally { release.countDown(); worker.stop(); }
+    }
+
+    @Test void defaultDisabledAndMissingClientCannotStart() {
+        Fixture f = fixture(1);
+        assertFalse(settings.enabled()); assertEquals("QUEUED", state(f)); assertTrue(server.paths.isEmpty());
+        var missing = new AnalysisWorker(new AnalysisSettings(true, 3, 60, 300), jobs, snapshots, Optional.empty(), analyzer);
+        assertThrows(IllegalStateException.class, missing::start);
+    }
+}

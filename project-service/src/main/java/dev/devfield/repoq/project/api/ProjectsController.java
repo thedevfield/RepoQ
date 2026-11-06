@@ -2,6 +2,7 @@ package dev.devfield.repoq.project.api;
 
 import tools.jackson.databind.JsonNode;
 import dev.devfield.repoq.project.data.Projects;
+import dev.devfield.repoq.project.analysis.ProjectAnalysisReads;
 import dev.devfield.repoq.project.github.GitHubRepositoryClient;
 import dev.devfield.repoq.project.github.GitHubConnections;
 import dev.devfield.repoq.project.github.GitHubUrl;
@@ -42,17 +43,19 @@ public class ProjectsController {
     private final AuthSessionVerifier sessions;
     private final GitHubRepositoryClient github;
     private final Projects projects;
+    private final ProjectAnalysisReads reads;
     private final GitHubConnections connections;
     private final boolean privateEnabled;
     private final String policyVersion;
 
     public ProjectsController(AuthSessionVerifier sessions, GitHubRepositoryClient github, Projects projects,
-                              GitHubConnections connections,
+                              GitHubConnections connections, ProjectAnalysisReads reads,
                               @Value("${devfield.project.github.private-registration-enabled:false}") String enabled,
                               @Value("${devfield.project.github.private-consent-policy-version:}") String policyVersion) {
         this.sessions = sessions;
         this.github = github;
         this.projects = projects;
+        this.reads = reads;
         this.connections = connections;
         this.privateEnabled = "true".equals(enabled);
         this.policyVersion = policyVersion;
@@ -95,14 +98,14 @@ public class ProjectsController {
     @GetMapping
     public List<Projects.Item> list(@RequestHeader("Authorization") String bearer, @AuthenticationPrincipal Jwt jwt) {
         sessions.verify(bearer);
-        return projects.list(UUID.fromString(jwt.getSubject()));
+        return reads.list(UUID.fromString(jwt.getSubject()));
     }
 
     @GetMapping("/{id}")
     public Projects.Detail detail(@RequestHeader("Authorization") String bearer, @AuthenticationPrincipal Jwt jwt,
                                   @PathVariable UUID id) {
         sessions.verify(bearer);
-        return projects.detail(UUID.fromString(jwt.getSubject()), id);
+        return reads.detail(UUID.fromString(jwt.getSubject()), id);
     }
 
     @PostMapping("/{id}/repositories")
