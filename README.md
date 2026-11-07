@@ -32,6 +32,12 @@ Configure Interview with `INTERVIEW_AUTH_ISSUER`, `INTERVIEW_AUTH_AUDIENCE`, `IN
 
 Production requires HTTPS or an equivalently protected transport path (such as a TLS-encrypted service mesh) for Interview → Project and Interview → Auth. Use plain HTTP only for local loopback development and tests.
 
+## Interview deletion (X-02 / X-04)
+
+Persist the first `deletionJobId` for the target and reuse it on every retry, including after a timeout or lost response. Once a deletion fence binds a target to a job ID, a different job ID for that target returns `409 deletion_conflict`, even after completion. A retry with the original ID returns `204 No Content` once cleanup is committed.
+
+Use three independent service keys for X-01 (Interview → Project), X-02 (Project → Interview), and X-04 (Auth → Interview). Configure the SHA-256 hex hashes for the inbound deletion keys as `INTERVIEW_X02_PROJECT_KEY_SHA256` and `INTERVIEW_X04_AUTH_KEY_SHA256`. Production requires HTTPS or an equivalently protected transport path for all three calls. Plain HTTP is limited to local loopback development and tests.
+
 ## Local PostgreSQL
 
 The single local Compose entry point is compose.local.yaml. It creates a separate development container and one database with auth, project and interview schemas. The Compose file lives here for local integration only; each service owns only its schema.
