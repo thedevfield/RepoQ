@@ -16,6 +16,7 @@ spring:
 
 devfield:
   project:
+    interview-key-sha256: ${PROJECT_X01_INTERVIEW_KEY_SHA256:}
     analysis:
       enabled: ${PROJECT_ANALYSIS_ENABLED:false}
       max-attempts: ${PROJECT_ANALYSIS_MAX_ATTEMPTS:3}

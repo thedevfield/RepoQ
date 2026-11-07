@@ -2,7 +2,10 @@ package dev.devfield.repoq.project.analysis;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import dev.devfield.repoq.project.api.ApiProblem;
 import dev.devfield.repoq.project.data.ProjectWriteFence;
+import dev.devfield.repoq.project.github.GitHubSourceClient;
+import org.springframework.http.HttpStatus;
 import dev.devfield.repoq.project.data.Projects;
 import java.util.*;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -17,6 +20,11 @@ public class ProjectAnalysisReads {
     public record Snapshot(UUID snapshotId, long membershipVersion, List<SnapshotMember> members, List<String> topics,
                            List<AnalysisSnapshots.Relation> relations, List<AnalysisSnapshots.Coverage> coverage,
                            List<Evidence> evidenceReferences) {}
+    public record InterviewTopic(String key, UUID primaryEvidenceId) {}
+    public record InterviewData(UUID snapshotId, long membershipVersion, List<SnapshotMember> members,
+                                List<InterviewTopic> topics, List<AnalysisSnapshots.Relation> relations,
+                                List<Evidence> evidenceReferences) {}
+
     private final Projects projects;
     private final JdbcTemplate db;
     private final TransactionTemplate tx;
@@ -84,6 +92,72 @@ public class ProjectAnalysisReads {
             return new Projects.Detail(base.id(), base.name(), base.projectStatus(), safeState, false, current,
                     version, members, false);
         });
+    }
+
+    public InterviewData interviewData(UUID owner, UUID project) {
+        Snapshot selected = tx.execute(status -> interviewCandidate(owner, project));
+        var sources = selected.members().stream().map(m ->
+                new PublicAccessVerifier.Source(m.repositoryId(), m.githubRepositoryId(), m.commitSha())).toList();
+        PublicAccessVerifier.Proof proof;
+        try {
+            proof = verifier.orElseThrow().verify(sources);
+        } catch (GitHubSourceClient.Failure failure) {
+            throw switch (failure.code()) {
+                case "repository_not_public", "repository_id_mismatch", "github_not_found", "github_access_denied" ->
+                        new ApiProblem(HttpStatus.FORBIDDEN, "repository_access_unavailable");
+                case "github_rate_limited" -> new ApiProblem(HttpStatus.SERVICE_UNAVAILABLE, "github_rate_limited");
+                case "github_timeout" -> new ApiProblem(HttpStatus.SERVICE_UNAVAILABLE, "github_timeout");
+                default -> new ApiProblem(HttpStatus.SERVICE_UNAVAILABLE, "github_unavailable");
+            };
+        } catch (RuntimeException failure) {
+            throw new ApiProblem(HttpStatus.SERVICE_UNAVAILABLE, "github_unavailable");
+        }
+        if (proof == null || !proof.validFor(sources))
+            throw new ApiProblem(HttpStatus.SERVICE_UNAVAILABLE, "github_unavailable");
+
+        return tx.execute(status -> {
+            Snapshot current = interviewCandidate(owner, project);
+            if (!selected.snapshotId().equals(current.snapshotId()) ||
+                    selected.membershipVersion() != current.membershipVersion() || !selected.members().equals(current.members()))
+                throw new ApiProblem(HttpStatus.CONFLICT, "snapshot_changed");
+            var topics = db.query("SELECT topic_key,primary_evidence_id FROM project.available_topic " +
+                            "WHERE snapshot_id=? AND is_active ORDER BY topic_key LIMIT 65",
+                    (rs, n) -> new InterviewTopic(rs.getString(1), rs.getObject(2, UUID.class)), current.snapshotId());
+            Map<UUID, Evidence> facts = new HashMap<>();
+            for (Evidence evidence : current.evidenceReferences()) {
+                if ("CODE_FACT".equals(evidence.claimType())) facts.put(evidence.id(), evidence);
+            }
+            if (topics.isEmpty() || topics.size() > 64 ||
+                    topics.stream().anyMatch(topic -> !facts.containsKey(topic.primaryEvidenceId())))
+                throw new ApiProblem(HttpStatus.CONFLICT, "snapshot_unavailable");
+
+            // The current Worker publishes no relations. Keep only relations supported by transmitted code facts.
+            var relations = current.relations().stream().filter(relation ->
+                    "CODE_FACT".equals(relation.claimType()) && !relation.evidenceIds().isEmpty() &&
+                            facts.keySet().containsAll(relation.evidenceIds())).toList();
+            Set<UUID> included = new HashSet<>();
+            topics.forEach(topic -> included.add(topic.primaryEvidenceId()));
+            relations.forEach(relation -> included.addAll(relation.evidenceIds()));
+            var evidence = current.evidenceReferences().stream().filter(ref -> included.contains(ref.id())).toList();
+            if (!proof.validFor(sources)) throw new ApiProblem(HttpStatus.SERVICE_UNAVAILABLE, "github_unavailable");
+            return new InterviewData(current.snapshotId(), current.membershipVersion(), current.members(),
+                    topics, relations, evidence);
+        });
+    }
+
+    private Snapshot interviewCandidate(UUID owner, UUID project) {
+        // Check ownership before creating or locking the user fence, and before any GitHub request.
+        projects.requireOwned(owner, project);
+        ProjectWriteFence.lockUser(db, owner);
+        long version = ProjectWriteFence.lockProject(db, owner, project);
+        if (Boolean.TRUE.equals(db.queryForObject("SELECT EXISTS(SELECT 1 FROM project.project_repository " +
+                "WHERE project_id=? AND removed_at IS NULL AND visibility<>'PUBLIC')", Boolean.class, project)))
+            throw new ApiProblem(HttpStatus.FORBIDDEN, "private_analysis_not_supported");
+        Snapshot snapshot = candidate(owner, project, version);
+        if (snapshot == null || snapshot.members().size() > 20 || snapshot.evidenceReferences().size() > 200 ||
+                snapshot.relations().size() > 100)
+            throw new ApiProblem(HttpStatus.CONFLICT, "snapshot_unavailable");
+        return snapshot;
     }
 
     private Snapshot candidate(UUID owner, UUID project, long version) {

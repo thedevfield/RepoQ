@@ -5,6 +5,8 @@ import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import dev.devfield.repoq.interview.project.ProjectSnapshotClient;
+import dev.devfield.repoq.interview.security.InterviewAuthentication;
 import dev.devfield.repoq.project.data.Projects;
 import dev.devfield.repoq.project.github.GitHubRepositoryClient;
 import dev.devfield.repoq.project.github.GitHubSourceClient;
@@ -32,9 +34,12 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
         "devfield.project.auth.issuer=test-issuer", "devfield.project.auth.audience=test-audience",
         "devfield.project.auth.jwks-uri=http://127.0.0.1:1/api/auth/jwks",
         "devfield.project.auth.session-check-uri=http://127.0.0.1:1/internal/auth/session-check",
-        "devfield.project.auth.service-key=test-service-key"
+        "devfield.project.auth.service-key=test-service-key",
+        "devfield.project.interview-key-sha256=72f151df5dd04aa4638b3f98bf13dd25bae9c980dc88b8afe67487096473fb72"
 })
 class PublicAnalysisIntegrationTest {
+    private static final String X01_KEY = "x01-interview-fixture-key-for-tests-only";
+
     @Autowired JdbcTemplate db;
     @Autowired Projects projects;
     @Autowired AnalysisJobs jobs;
@@ -59,6 +64,7 @@ class PublicAnalysisIntegrationTest {
         when(decoder.decode(anyString())).thenAnswer(call -> new Jwt(call.getArgument(0), Instant.now().minusSeconds(10),
                 Instant.now().plusSeconds(300), Map.of("alg", "RS256"),
                 Map.of("sub", "other".equals(call.getArgument(0)) ? UUID.randomUUID().toString() : owner.toString())));
+        when(decoder.decode("expired")).thenThrow(new org.springframework.security.oauth2.jwt.BadJwtException("Expired token"));
     }
     @AfterEach void cleanup() {
         worker.stop(); server.close();
@@ -107,6 +113,110 @@ class PublicAnalysisIntegrationTest {
         assertEquals(calls, server.paths.size());
         assertTrue(get("/api/projects").toString().contains("READY"));
         assertEquals(0, server.authorizationHeaders.get());
+    }
+
+    private HttpResponse<String> interviewData(Fixture fixture, String query, String token, String key) throws Exception {
+        var request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/internal/projects/" +
+                fixture.project() + "/interview-data" + query)).GET();
+        if (token != null) request.header("Authorization", "Bearer " + token);
+        if (key != null) request.header("X-DevField-Service", "interview").header("X-DevField-Service-Key", key);
+        return HttpClient.newHttpClient().send(request.build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    @ParameterizedTest @ValueSource(ints = {1, 2})
+    void interviewDataUsesStoredTopicsAndPreviousReadySnapshot(int count) throws Exception {
+        Fixture f = fixture(count);
+        worker.runJob(f.job()); assertEquals("READY", state(f));
+        var response = interviewData(f, "", "owner", X01_KEY);
+        assertEquals(200, response.statusCode());
+        assertEquals("no-store", response.headers().firstValue("Cache-Control").orElseThrow());
+        JsonNode snapshot = json.readTree(response.body());
+        var interviewClient = new ProjectSnapshotClient(mock(InterviewAuthentication.class),
+                "http://127.0.0.1:" + port, X01_KEY);
+        var parsed = interviewClient.fetch(f.project(), "Bearer owner");
+        assertEquals(snapshot, json.readTree(json.writeValueAsBytes(parsed)));
+        assertEquals(count, snapshot.path("members").size());
+        assertFalse(snapshot.has("coverage"));
+        assertTrue(snapshot.path("relations").isEmpty());
+        assertFalse(snapshot.path("topics").isEmpty());
+        for (JsonNode topic : snapshot.path("topics")) {
+            UUID stored = db.queryForObject("SELECT primary_evidence_id FROM project.available_topic WHERE snapshot_id=? AND topic_key=?",
+                    UUID.class, UUID.fromString(snapshot.path("snapshotId").asText()), topic.path("key").asText());
+            assertEquals(stored.toString(), topic.path("primaryEvidenceId").asText());
+            assertTrue(snapshot.path("evidenceReferences").valueStream().anyMatch(ref ->
+                    stored.toString().equals(ref.path("id").asText()) && "CODE_FACT".equals(ref.path("claimType").asText())));
+        }
+        UUID next = UUID.randomUUID();
+        db.update("INSERT INTO project.analysis_job(id,project_id,trigger_kind,state,analysis_version,created_at) " +
+                "VALUES (?,?,'USER_REANALYZE','RUNNING','test',clock_timestamp())", next, f.project());
+        assertEquals(snapshot, json.readTree(interviewData(f, "?evidenceScope=PUBLIC_ONLY", "owner", X01_KEY).body()));
+        db.update("UPDATE project.analysis_job SET state='FAILED' WHERE id=?", next);
+        assertEquals(snapshot, json.readTree(interviewData(f, "", "owner", X01_KEY).body()));
+    }
+
+    @Test void interviewDataFailsClosedBeforeOrAfterPublicVerification() throws Exception {
+        Fixture f = fixture(2);
+        assertInterviewError(f, "", "owner", X01_KEY, 409, "snapshot_unavailable");
+        worker.runJob(f.job()); assertEquals("READY", state(f));
+        int before = server.paths.size();
+        assertInterviewError(f, "", null, X01_KEY, 401, "invalid_token");
+        assertInterviewError(f, "", "expired", X01_KEY, 401, "invalid_token");
+        assertInterviewError(f, "", "owner", null, 403, "forbidden");
+        assertInterviewError(f, "", "owner", "x".repeat(32), 403, "forbidden");
+        assertInterviewError(f, "", "other", X01_KEY, 404, "project_not_found");
+        assertInterviewError(f, "?evidenceScope=FULL", "owner", X01_KEY, 403, "evidence_scope_not_supported");
+        assertInterviewError(f, "?evidenceScope=UNKNOWN", "owner", X01_KEY, 400, "invalid_request");
+        assertInterviewError(f, "?evidenceScope=PUBLIC_ONLY&evidenceScope=FULL", "owner", X01_KEY, 400, "invalid_request");
+        assertEquals(before, server.paths.size());
+
+        server.repos.get("42").privateRepo = true;
+        assertInterviewError(f, "", "owner", X01_KEY, 403, "repository_access_unavailable");
+        server.repos.get("42").privateRepo = false;
+        for (String failure : List.of("github_timeout", "github_rate_limited", "github_unavailable")) {
+            doThrow(new GitHubSourceClient.Failure(failure)).when(verifier).verify(anyList());
+            assertInterviewError(f, "", "owner", X01_KEY, 503, failure);
+        }
+        doAnswer(call -> {
+            assertFalse(org.springframework.transaction.support.TransactionSynchronizationManager.isActualTransactionActive());
+            var proof = client.verify(call.getArgument(0));
+            db.update("UPDATE project.registered_project SET membership_version=membership_version+1 WHERE id=?", f.project());
+            return proof;
+        }).when(verifier).verify(anyList());
+        assertInterviewError(f, "", "owner", X01_KEY, 409, "snapshot_unavailable");
+    }
+
+    @Test void interviewDataRejectsPrivateMembershipBadTopicAndDeletingProject() throws Exception {
+        Fixture f = fixture(2);
+        worker.runJob(f.job()); assertEquals("READY", state(f));
+        // Build a corrupted fixture through permitted inserts while the source job is temporarily RUNNING.
+        db.update("UPDATE project.analysis_job SET state='RUNNING' WHERE id=?", f.job());
+        db.update("INSERT INTO project.evidence_reference(id,snapshot_id,snapshot_member_id,github_repository_id," +
+                "commit_sha,file_path,claim_type,summary) SELECT ?,snapshot_id,id,github_repository_id,commit_sha," +
+                "'README.md','DOC_CLAIM','Documentation claim' FROM project.snapshot_member WHERE project_id=? LIMIT 1",
+                UUID.randomUUID(), f.project());
+        db.update("INSERT INTO project.available_topic(id,snapshot_id,topic_key,is_active,primary_evidence_id) " +
+                "SELECT ?,e.snapshot_id,'INVALID_TOPIC',true,e.id FROM project.evidence_reference e " +
+                "JOIN project.analysis_snapshot s ON s.id=e.snapshot_id " +
+                "WHERE s.project_id=? AND e.claim_type='DOC_CLAIM'", UUID.randomUUID(), f.project());
+        db.update("UPDATE project.analysis_job SET state='READY' WHERE id=?", f.job());
+        assertInterviewError(f, "", "owner", X01_KEY, 409, "snapshot_unavailable");
+        UUID connection = UUID.randomUUID();
+        db.update("INSERT INTO project.github_connection(id,devfield_user_id) VALUES (?,?)", connection, owner);
+        db.update("UPDATE project.project_repository SET visibility='PRIVATE',github_connection_id=? " +
+                "WHERE project_id=? AND github_repository_id='43'", connection, f.project());
+        int before = server.paths.size();
+        assertInterviewError(f, "", "owner", X01_KEY, 403, "private_analysis_not_supported");
+        db.update("UPDATE project.project_write_fence SET state='DELETING',deletion_job_id=? WHERE project_id=?",
+                UUID.randomUUID(), f.project());
+        assertInterviewError(f, "", "owner", X01_KEY, 409, "project_unavailable");
+        assertEquals(before, server.paths.size());
+    }
+
+    private void assertInterviewError(Fixture f, String query, String token, String key, int status, String code) throws Exception {
+        var response = interviewData(f, query, token, key);
+        assertEquals(status, response.statusCode());
+        if (status != 401 || !response.body().isEmpty())
+            assertEquals(json.createObjectNode().put("code", code), json.readTree(response.body()));
     }
 
     @Test void privateTransitionAndOutageHideSnapshotAndSha() throws Exception {

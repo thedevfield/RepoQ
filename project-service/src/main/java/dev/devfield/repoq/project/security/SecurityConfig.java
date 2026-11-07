@@ -5,6 +5,7 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import java.util.UUID;
 import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.http.HttpMethod;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.oauth2.core.OAuth2Error;
@@ -30,6 +31,7 @@ public class SecurityConfig {
                 .authorizeHttpRequests(authorize -> authorize
                         .requestMatchers("/actuator/health", "/actuator/health/**").permitAll()
                         .requestMatchers("/api/github/webhook").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/internal/projects/*/interview-data").authenticated()
                         .requestMatchers("/api/projects", "/api/projects/*",
                                 "/api/projects/*/repositories", "/api/projects/*/repositories/*").authenticated()
                         .requestMatchers("/api/github/connections/start", "/api/github/connections/callback/complete",
