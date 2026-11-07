@@ -46,6 +46,12 @@ Configure `PROJECT_INTERVIEW_BASE_URL` as the fixed Interview origin and `PROJEC
 
 P-06 preserves shared GitHub connections and user/repository consent history. The completed fence retains a hash of the old P-01 idempotency key, if present, to reject a replay that would recreate the deleted project.
 
+## Project account cleanup (X-03)
+
+`DELETE /internal/users/{userId}/data` accepts an Auth service command with `userId`, `deletionJobId`, and `state: "DELETING"`. Set `PROJECT_X03_AUTH_KEY_SHA256` to the SHA-256 hex digest of an independent X-03 key and send the raw key as `X-DevField-Service-Key` with `X-DevField-Service: auth` over protected transport. Reuse the same job ID on retry.
+
+Project commits its USER barrier before cleanup, takes over pending P-06 work for that user, and returns 204 only after deleting Project-owned data and recording completion. The USER tombstone remains to prevent late writes. Auth coordinates Interview X-04 separately.
+
 ## Local PostgreSQL
 
 The single local Compose entry point is compose.local.yaml. It creates a separate development container and one database with auth, project and interview schemas. The Compose file lives here for local integration only; each service owns only its schema.

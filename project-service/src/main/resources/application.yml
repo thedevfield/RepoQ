@@ -18,6 +18,7 @@ devfield:
   project:
     interview-key-sha256: ${PROJECT_X01_INTERVIEW_KEY_SHA256:}
     deletion:
+      auth-key-sha256: ${PROJECT_X03_AUTH_KEY_SHA256:}
       interview-url: ${PROJECT_INTERVIEW_BASE_URL:}
       service-key: ${PROJECT_X02_SERVICE_KEY:}
       timeout-seconds: ${PROJECT_X02_TIMEOUT_SECONDS:10}

@@ -399,7 +399,7 @@ public class Projects {
         var owners = db.query("SELECT devfield_user_id FROM project.github_connection " +
                 "WHERE installation_id=? ORDER BY devfield_user_id", (rs, n) -> rs.getObject(1, UUID.class), installationId);
         for (UUID owner : owners) {
-            lockUser(owner);
+            if (!ProjectWriteFence.lockUserFence(db, owner).active()) continue;
             var connections = db.query("SELECT id FROM project.github_connection WHERE devfield_user_id=? " +
                     "AND installation_id=?", (rs, n) -> rs.getObject(1, UUID.class), owner, installationId);
             if (connections.isEmpty()) continue;
@@ -418,7 +418,9 @@ public class Projects {
     public void blockGitHubUser(long githubUserId) {
         var owners = db.query("SELECT devfield_user_id,id FROM project.github_connection WHERE github_user_id=?",
                 (rs, n) -> new UUID[]{rs.getObject(1, UUID.class), rs.getObject(2, UUID.class)}, githubUserId);
-        for (UUID[] pair : owners) disconnect(pair[0], pair[1]);
+        for (UUID[] pair : owners) {
+            if (ProjectWriteFence.lockUserFence(db, pair[0]).active()) disconnect(pair[0], pair[1]);
+        }
     }
 
     private List<UUID> projectIds(UUID owner, String predicate, Object value) {

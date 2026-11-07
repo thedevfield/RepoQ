@@ -1,6 +1,7 @@
 package dev.devfield.repoq.project.github;
 
 import dev.devfield.repoq.project.api.ApiProblem;
+import dev.devfield.repoq.project.data.ProjectWriteFence;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
@@ -71,6 +72,7 @@ public class GitHubConnections {
         UUID id = UUID.randomUUID();
         Instant expiry = Instant.now().plusSeconds(ttl);
         String[] values = tx.execute(s -> {
+            ProjectWriteFence.lockUser(db, user);
             db.update("INSERT INTO project.github_connection(id,devfield_user_id) VALUES (?,?) " +
                     "ON CONFLICT (devfield_user_id) DO NOTHING", UUID.randomUUID(), user);
             Connection current = connection(user, true);
@@ -114,6 +116,7 @@ public class GitHubConnections {
         catch (ApiProblem e) { log.warn("GitHub App callback user verification failed: {}", e.code()); throw e; }
         try {
             tx.executeWithoutResult(s -> {
+                ProjectWriteFence.lockUser(db, user);
                 db.update("INSERT INTO project.github_connection (id,devfield_user_id) VALUES (?,?) ON CONFLICT (devfield_user_id) DO NOTHING",
                         UUID.randomUUID(), user);
                 Connection existing = connection(user, true);
@@ -155,6 +158,7 @@ public class GitHubConnections {
             throw e;
         }
         tx.executeWithoutResult(s -> {
+            ProjectWriteFence.lockUser(db, user);
             Connection current = connection(user, true);
             if (current == null || !current.id().equals(attempt.connectionId()) ||
                     current.generation() != attempt.generation() || !"AUTHORIZED".equals(current.userState()))
@@ -174,7 +178,7 @@ public class GitHubConnections {
 
     @Transactional
     public Listing repositories(UUID user, int page, int size) {
-        lockUser(user);
+        ProjectWriteFence.lockUser(db, user);
         configured();
         if (page < 1 || page > 10000 || size < 1 || size > 100) throw invalid();
         Connection c = connection(user, false);
@@ -198,15 +202,6 @@ public class GitHubConnections {
                 tokenTx.executeWithoutResult(s -> revokeUserToken(user));
             throw e;
         }
-    }
-
-    private void lockUser(UUID user) {
-        db.update("INSERT INTO project.project_write_fence(id,scope,owner_user_id,state) " +
-                "VALUES (?,'USER',?,'ACTIVE') ON CONFLICT (owner_user_id) WHERE scope='USER' DO NOTHING",
-                UUID.randomUUID(), user);
-        String state = db.queryForObject("SELECT state FROM project.project_write_fence " +
-                "WHERE scope='USER' AND owner_user_id=? FOR UPDATE", String.class, user);
-        if (!"ACTIVE".equals(state)) throw new ApiProblem(HttpStatus.FORBIDDEN, "account_unavailable");
     }
 
     public UUID requirePrivateRepository(UUID user, String repositoryId) {
@@ -240,6 +235,10 @@ public class GitHubConnections {
     }
 
     private void revokeUserToken(UUID user) {
+        var rows = db.query("SELECT id FROM project.github_connection WHERE devfield_user_id=? FOR NO KEY UPDATE",
+                (rs, n) -> rs.getObject(1, UUID.class), user);
+        if (rows.isEmpty()) return;
+        requireActiveTokenOwner(user);
         db.update("UPDATE project.github_connection SET user_state='REAUTHORIZE',generation=generation+1," +
                 "installation_state='NOT_INSTALLED'," +
                 "installation_id=NULL,access_token_ciphertext=NULL,refresh_token_ciphertext=NULL," +
@@ -251,6 +250,7 @@ public class GitHubConnections {
         String result = tokenTx.execute(s -> {
             Connection c = connection(user, true);
             if (c == null || !"AUTHORIZED".equals(c.userState())) return null;
+            requireActiveTokenOwner(user);
             if (c.accessExpiry().isAfter(Instant.now().plusSeconds(skew)))
                 return cipher.decrypt(c.access(), c.keyVersion(), "access:" + c.id());
             if (c.refreshExpiry().isAfter(Instant.now().plusSeconds(skew))) {
@@ -273,9 +273,19 @@ public class GitHubConnections {
         return result;
     }
 
+    private void requireActiveTokenOwner(UUID user) {
+        // X-03 takes the connection lock before committing its USER barrier. Do not lock USER
+        // here: an outer transaction can already hold it while this REQUIRES_NEW transaction runs.
+        if (Boolean.TRUE.equals(db.queryForObject("""
+                SELECT EXISTS(SELECT 1 FROM project.project_write_fence
+                WHERE scope='USER' AND owner_user_id=? AND state<>'ACTIVE')
+                """, Boolean.class, user))) throw new ApiProblem(HttpStatus.FORBIDDEN, "account_unavailable");
+    }
+
     private Attempt consume(UUID user, UUID session, String proof, String kind) {
         if (proof == null || !proof.matches("[A-Za-z0-9_-]{43}")) throw invalid();
         return tx.execute(s -> {
+            ProjectWriteFence.lockUser(db, user);
             var matches = db.query("UPDATE project.github_connection_attempt SET consumed_at=now() " +
                     "WHERE state_hash=? AND devfield_user_id=? AND devfield_session_id=? AND kind=? " +
                     "AND consumed_at IS NULL AND expires_at>now() RETURNING id,devfield_user_id,devfield_session_id," +
