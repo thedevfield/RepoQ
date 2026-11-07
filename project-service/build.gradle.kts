@@ -29,6 +29,7 @@ dependencies {
     runtimeOnly("org.postgresql:postgresql")
     testImplementation(platform("org.springframework.boot:spring-boot-dependencies:4.0.9"))
     testImplementation("org.springframework.boot:spring-boot-starter-test")
+    testImplementation(project(":interview-service"))
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
