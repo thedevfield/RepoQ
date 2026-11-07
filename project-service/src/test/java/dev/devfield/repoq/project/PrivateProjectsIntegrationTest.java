@@ -512,6 +512,33 @@ class PrivateProjectsIntegrationTest {
     }
 
     @Test
+    void privateRevocationAndDisconnectRemainEffectiveWhileProjectIsDeleting() throws Exception {
+        prepare();
+        var deleting = call("POST", "/api/projects", "owner", "{\"repositories\":[" + PRIVATE + "]}", null);
+        var sibling = call("POST", "/api/projects", "owner",
+                "{\"repositories\":[" + PRIVATE.replace("\"72\"", "\"73\"") + "]}", null);
+        assertEquals(201, deleting.statusCode());
+        assertEquals(201, sibling.statusCode());
+        UUID project = UUID.fromString(json.readTree(deleting.body()).path("id").asText());
+        UUID active = UUID.fromString(json.readTree(sibling.body()).path("id").asText());
+        assertEquals(202, call("DELETE", "/api/projects/" + project, "owner", null, null).statusCode());
+        String consents = "/api/github/repositories/72/consents";
+        assertEquals(202, call("PUT", consents, "owner", "{\"consents\":[{\"purpose\":\"PRIVATE_COLLECTION\"," +
+                "\"decision\":\"REVOKED\",\"policyVersion\":\"test-v1\"}]}", null).statusCode());
+        String granted = "{\"consents\":" + PRIVATE.substring(PRIVATE.indexOf('['), PRIVATE.lastIndexOf(']') + 1) + "}";
+        assertEquals(200, call("PUT", consents, "owner", granted, null).statusCode());
+        assertEquals("BLOCKED", db.queryForObject("SELECT access_state FROM project.project_repository WHERE project_id=?",
+                String.class, project));
+        assertEquals(202, call("DELETE", "/api/github/connections/" + connectionId, "owner", null, null).statusCode());
+        assertEquals("BLOCKED", db.queryForObject("SELECT access_state FROM project.project_repository WHERE project_id=?",
+                String.class, active));
+        assertEquals(1L, db.queryForObject("SELECT membership_version FROM project.registered_project WHERE id=?",
+                Long.class, project));
+        assertEquals(1, db.queryForObject("SELECT count(*) FROM project.analysis_job WHERE project_id=?", Integer.class, project));
+        assertEquals("DELETING", db.queryForObject("SELECT state FROM project.registered_project WHERE id=?", String.class, project));
+    }
+
+    @Test
     void disconnectDiscardsTokensAndBlocksPrivate() throws Exception {
         prepare();
         var created = call("POST", "/api/projects", "owner", "{\"repositories\":[" + PRIVATE + "]}", null);

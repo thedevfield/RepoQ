@@ -75,6 +75,10 @@ public class Projects {
     @Transactional
     public Registration replayRegistration(UUID owner, String key, String hash) {
         lockUser(owner);
+        if (Boolean.TRUE.equals(db.queryForObject("""
+                SELECT EXISTS(SELECT 1 FROM project.project_write_fence
+                WHERE scope='PROJECT' AND owner_user_id=? AND deleted_create_key_hash=sha256(convert_to(?, 'UTF8')))
+                """, Boolean.class, owner, key))) throw conflict("idempotency_key_conflict");
         var prior = db.query("SELECT p.create_request_hash,j.response_json::text,p.state,uf.state " +
                         "FROM project.registered_project p " +
                         "JOIN project.analysis_job j ON j.project_id=p.id AND j.trigger_kind='INITIAL' " +
@@ -228,13 +232,15 @@ public class Projects {
         return db.query("SELECT p.id,p.display_name,j.state," +
                         "(SELECT count(*) FROM project.project_repository r WHERE r.project_id=p.id AND r.removed_at IS NULL)," +
                         "(SELECT count(*) FROM project.project_repository r WHERE r.project_id=p.id " +
-                        "AND r.removed_at IS NULL AND r.visibility='PRIVATE') " +
+                        "AND r.removed_at IS NULL AND r.visibility='PRIVATE'),p.state " +
                         "FROM project.registered_project p " +
                         "JOIN LATERAL (SELECT state FROM project.analysis_job WHERE project_id=p.id " +
                         "ORDER BY created_at DESC,id DESC LIMIT 1) j ON true " +
                         "WHERE p.owner_user_id=? ORDER BY p.created_at DESC,p.id DESC",
                 (rs, row) -> {
                     UUID id = rs.getObject(1, UUID.class);
+                    if ("DELETING".equals(rs.getString(6)))
+                        return new Item(id, "Project deleting", "CANCELLED", rs.getInt(4), rs.getInt(5), false);
                     boolean blocked = privateMembers(owner, id).stream().anyMatch(m -> !accessible(owner, m));
                     return new Item(id, blocked ? "Private access unavailable" : rs.getString(2), safeStatus(rs.getString(3)),
                             rs.getInt(4), rs.getInt(5), false);
@@ -266,11 +272,21 @@ public class Projects {
                 (rs, index) -> new Member(rs.getObject(1, UUID.class), rs.getString(2), rs.getString(3),
                         rs.getString(4), rs.getString(5), safeStatus(rs.getString(6)), rs.getString(7)),
                 jobId, row[5], jobId, id);
+        if ("DELETING".equals(row[2]))
+            return deleting(new Detail((UUID) row[0], (String) row[1], (String) row[2], "CANCELLED",
+                    false, null, (Long) row[3], members, false));
         List<Member> safe = redact(owner, members);
         boolean blocked = safe.stream().anyMatch(m -> "PRIVATE".equals(m.visibility()) &&
                 "BLOCKED".equals(m.accessStatus()));
         return new Detail((UUID) row[0], blocked ? "Private access unavailable" : (String) row[1], (String) row[2],
                 safeStatus((String) row[5]), false, null, (Long) row[3], safe, false);
+    }
+
+    public static Detail deleting(Detail detail) {
+        var hidden = detail.repositories().stream().map(m -> new Member(m.id(), null, null,
+                m.visibility(), "BLOCKED", "CANCELLED", null)).toList();
+        return new Detail(detail.id(), "Project deleting", "DELETING", "CANCELLED", false,
+                null, detail.membershipVersion(), hidden, false);
     }
 
     public void requireOwned(UUID owner, UUID id) {
@@ -341,7 +357,8 @@ public class Projects {
                             Boolean.class, owner, repositoryId));
                     db.update("UPDATE project.project_repository SET access_state='ACTIVE' " +
                             "WHERE owner_user_id=? AND github_repository_id=? AND removed_at IS NULL " +
-                            "AND visibility='PRIVATE'", owner, repositoryId);
+                            "AND visibility='PRIVATE' AND EXISTS (SELECT 1 FROM project.registered_project p " +
+                            "WHERE p.id=project_repository.project_id AND p.state='ACTIVE')", owner, repositoryId);
                     if (wasBlocked) for (UUID projectId : projects) {
                         long version = db.queryForObject("SELECT membership_version FROM project.registered_project " +
                                 "WHERE id=?", Long.class, projectId) + 1;
@@ -406,6 +423,7 @@ public class Projects {
 
     private List<UUID> projectIds(UUID owner, String predicate, Object value) {
         return db.query("SELECT DISTINCT r.project_id FROM project.project_repository r " +
+                        "JOIN project.registered_project p ON p.id=r.project_id AND p.state='ACTIVE' " +
                         "WHERE r.owner_user_id=? AND r.removed_at IS NULL AND " + predicate + " ORDER BY r.project_id",
                 (rs, n) -> rs.getObject(1, UUID.class), owner, value);
     }

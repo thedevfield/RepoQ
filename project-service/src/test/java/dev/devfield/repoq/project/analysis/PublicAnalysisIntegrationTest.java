@@ -4,6 +4,13 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.sun.net.httpserver.HttpServer;
+import dev.devfield.repoq.project.deletion.InterviewDeletionClient;
+import dev.devfield.repoq.project.deletion.ProjectDeletions;
+import dev.devfield.repoq.project.api.ApiProblem;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.springframework.transaction.support.TransactionTemplate;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.devfield.repoq.interview.project.ProjectSnapshotClient;
 import dev.devfield.repoq.interview.security.InterviewAuthentication;
@@ -35,12 +42,15 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
         "devfield.project.auth.jwks-uri=http://127.0.0.1:1/api/auth/jwks",
         "devfield.project.auth.session-check-uri=http://127.0.0.1:1/internal/auth/session-check",
         "devfield.project.auth.service-key=test-service-key",
+        "devfield.project.deletion.poll-interval=PT1H",
         "devfield.project.interview-key-sha256=72f151df5dd04aa4638b3f98bf13dd25bae9c980dc88b8afe67487096473fb72"
 })
 class PublicAnalysisIntegrationTest {
     private static final String X01_KEY = "x01-interview-fixture-key-for-tests-only";
 
     @Autowired JdbcTemplate db;
+    @Autowired TransactionTemplate tx;
+    @Autowired ProjectDeletions deletions;
     @Autowired Projects projects;
     @Autowired AnalysisJobs jobs;
     @Autowired AnalysisSnapshots snapshots;
@@ -54,6 +64,7 @@ class PublicAnalysisIntegrationTest {
     GitHubSourceClient client;
     AnalysisWorker worker;
     UUID owner;
+    UUID deletionSiblingOwner;
     final ObjectMapper json = new ObjectMapper();
     record Fixture(UUID project, UUID job) {}
 
@@ -68,6 +79,11 @@ class PublicAnalysisIntegrationTest {
     }
     @AfterEach void cleanup() {
         worker.stop(); server.close();
+        cleanupOwner(owner);
+        if (deletionSiblingOwner != null) cleanupOwner(deletionSiblingOwner);
+    }
+
+    private void cleanupOwner(UUID owner) {
         db.update("UPDATE project.registered_project SET latest_ready_snapshot_id=NULL WHERE owner_user_id=?", owner);
         for (String table : List.of("available_topic", "evidence_reference", "snapshot_member"))
             db.update("DELETE FROM project." + table + " WHERE snapshot_id IN (SELECT s.id FROM project.analysis_snapshot s " +
@@ -78,6 +94,7 @@ class PublicAnalysisIntegrationTest {
         db.update("DELETE FROM project.project_write_fence WHERE owner_user_id=?", owner);
         db.update("DELETE FROM project.registered_project WHERE owner_user_id=?", owner);
         db.update("DELETE FROM project.github_connection WHERE devfield_user_id=?", owner);
+        db.update("DELETE FROM project.repository_consent WHERE owner_user_id=?", owner);
     }
     Fixture fixture(int count) {
         List<GitHubRepositoryClient.Repository> repos = new ArrayList<>();
@@ -217,6 +234,291 @@ class PublicAnalysisIntegrationTest {
         assertEquals(status, response.statusCode());
         if (status != 401 || !response.body().isEmpty())
             assertEquals(json.createObjectNode().put("code", code), json.readTree(response.body()));
+    }
+
+    @Test void projectDeletionRetriesAndRemovesAllProjectOwnedDataAfterX02Only() throws Exception {
+        String createKey = "original-project-key";
+        var upstream = server.add("42");
+        var repository = new GitHubRepositoryClient.Repository(upstream.id, upstream.name, "fixture");
+        var registration = projects.register(owner, List.of(repository), "Public fixture", createKey, "fixture-hash");
+        UUID project = registration.id();
+        UUID firstJob = db.queryForObject("SELECT id FROM project.analysis_job WHERE project_id=?", UUID.class, project);
+        worker.runJob(firstJob);
+        assertEquals("READY", state(new Fixture(project, firstJob)));
+        UUID secondJob = queuedJob(project);
+        server.resetWindow();
+        worker.runJob(secondJob);
+        assertEquals("READY", state(new Fixture(project, secondJob)));
+        UUID runningJob = queuedJob(project);
+        var execution = jobs.claim(runningJob);
+        assertNotNull(execution);
+
+        deletionSiblingOwner = UUID.randomUUID();
+        UUID otherProject = projects.register(deletionSiblingOwner, repository, "Same GitHub repository").id();
+        UUID connection = UUID.randomUUID();
+        db.update("INSERT INTO project.github_connection(id,devfield_user_id) VALUES (?,?)", connection, owner);
+        var sibling = projects.register(owner,
+                new GitHubRepositoryClient.Repository("99", "owner/private", "private"), "Shared connection");
+        db.update("UPDATE project.project_repository SET visibility='PRIVATE',github_connection_id=? WHERE project_id=?",
+                connection, sibling.id());
+        db.update("INSERT INTO project.project_repository(id,project_id,owner_user_id,github_repository_id," +
+                "repository_full_name,visibility,github_connection_id) VALUES (?,?,?,'97','owner/private2','PRIVATE',?)",
+                UUID.randomUUID(), project, owner, connection);
+        db.update("INSERT INTO project.repository_consent(id,owner_user_id,github_repository_id,purpose,decision,policy_version) " +
+                "VALUES (?,?,'42','PRIVATE_COLLECTION','GRANTED','test')", UUID.randomUUID(), owner);
+        db.update("INSERT INTO project.project_repository(id,project_id,owner_user_id,github_repository_id," +
+                "repository_full_name,visibility,removed_at) VALUES (?,?,?,'98','owner/removed','PUBLIC',now())",
+                UUID.randomUUID(), project, owner);
+        seedTemporaryAnalysis(project, runningJob);
+
+        assertEquals(404, deleteProject(project, "other").statusCode());
+        JsonNode pending;
+        try (var callers = Executors.newFixedThreadPool(2)) {
+            var start = new CyclicBarrier(2);
+            Callable<HttpResponse<String>> request = () -> {
+                start.await(5, TimeUnit.SECONDS);
+                return deleteProject(project, "owner");
+            };
+            var first = callers.submit(request);
+            var second = callers.submit(request);
+            var accepted = first.get(10, TimeUnit.SECONDS);
+            var repeated = second.get(10, TimeUnit.SECONDS);
+            assertEquals(202, accepted.statusCode());
+            assertEquals(202, repeated.statusCode());
+            pending = json.readTree(accepted.body());
+            assertEquals(pending, json.readTree(repeated.body()));
+        }
+        assertEquals("CANCELLED", state(new Fixture(project, runningJob)));
+        assertThrows(RuntimeException.class, () -> jobs.heartbeat(execution));
+        assertEquals(0, countProjectRows("analysis_repository_checkpoint", project));
+        assertEquals(0, countProjectRows("analysis_file_progress", project));
+        int calls = server.paths.size();
+        var detail = get("/api/projects/" + project);
+        assertEquals("DELETING", detail.path("projectStatus").asText());
+        assertTrue(detail.path("latestReadySnapshot").isNull());
+        assertTrue(detail.path("repositories").get(0).path("commitSha").isNull());
+        assertTrue(detail.path("repositories").get(0).path("fullName").isNull());
+        assertFalse(detail.path("canInterview").asBoolean());
+        assertEquals(calls, server.paths.size());
+        assertInterviewError(new Fixture(project, runningJob), "", "owner", X01_KEY, 409, "project_unavailable");
+
+        var status = new AtomicInteger(503);
+        var validWire = new AtomicBoolean();
+        var responses = new AtomicInteger();
+        var loseResponse = new AtomicBoolean();
+        String key = "x02-dedicated-loopback-key-for-tests";
+        try (var threads = Executors.newVirtualThreadPerTaskExecutor()) {
+            var http = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            http.setExecutor(threads);
+            http.createContext("/", exchange -> {
+                try (exchange) {
+                    var body = json.readTree(exchange.getRequestBody());
+                    validWire.set(exchange.getRequestMethod().equals("DELETE") &&
+                            exchange.getRequestURI().getPath().equals("/internal/projects/" + project + "/interviews") &&
+                            "project".equals(exchange.getRequestHeaders().getFirst("X-DevField-Service")) &&
+                            key.equals(exchange.getRequestHeaders().getFirst("X-DevField-Service-Key")) &&
+                            exchange.getRequestHeaders().getFirst("Authorization") == null &&
+                            body.equals(json.createObjectNode().put("projectId", project.toString())
+                                    .put("ownerUserId", owner.toString())
+                                    .put("deletionJobId", pending.path("deletionJobId").asText())));
+                    if (loseResponse.get()) {
+                        responses.incrementAndGet();
+                        try { Thread.sleep(1400); }
+                        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                    }
+                    exchange.sendResponseHeaders(status.get(), -1);
+                }
+            });
+            http.start();
+            try {
+                var receiver = new InterviewDeletionClient("http://127.0.0.1:" + http.getAddress().getPort(), key, 1);
+                for (var failure : Map.of(503, "x02_unavailable", 409, "x02_deletion_conflict",
+                        401, "x02_auth_rejected", 403, "x02_auth_rejected").entrySet()) {
+                    status.set(failure.getKey());
+                    runDeletion(project, receiver);
+                    assertEquals(failure.getValue(), deletionFailure(project));
+                    assertEquals(2, countProjectRows("analysis_snapshot", project));
+                    assertTrue(validWire.get());
+                }
+                status.set(204);
+                loseResponse.set(true);
+                runDeletion(project, receiver);
+                assertEquals(1, responses.get());
+                assertEquals("x02_unavailable", deletionFailure(project));
+                assertEquals(2, countProjectRows("analysis_snapshot", project));
+                loseResponse.set(false);
+
+                String blocker = "project.test_delete_" + UUID.randomUUID().toString().replace("-", "");
+                db.execute("CREATE TABLE " + blocker + " (id uuid REFERENCES project.registered_project(id))");
+                try {
+                    db.update("INSERT INTO " + blocker + " VALUES (?)", project);
+                    runDeletion(project, receiver);
+                    assertEquals("project_cleanup_failed", deletionFailure(project));
+                    assertEquals(2, countProjectRows("analysis_snapshot", project));
+                } finally {
+                    db.execute("DROP TABLE " + blocker);
+                }
+                runDeletion(project, receiver);
+                assertTrue(validWire.get());
+                assertEquals(204, deleteProject(project, "owner").statusCode());
+                assertEquals(404, deleteProject(project, "other").statusCode());
+                assertEquals(404, call("/api/projects/" + project, "owner").statusCode());
+                for (String table : List.of("analysis_snapshot", "snapshot_member", "analysis_job", "project_repository"))
+                    assertEquals(0, countProjectRows(table, project), table);
+                assertEquals(1, countProjectRows("project_repository", otherProject));
+                assertEquals(1, countProjectRows("project_repository", sibling.id()));
+                assertEquals(1, db.queryForObject("SELECT count(*) FROM project.github_connection WHERE id=?", Integer.class, connection));
+                assertEquals(1, db.queryForObject("SELECT count(*) FROM project.repository_consent WHERE owner_user_id=?",
+                        Integer.class, owner));
+                assertEquals("idempotency_key_conflict",
+                        assertThrows(ApiProblem.class, () -> projects.replayRegistration(owner, createKey, "fixture-hash")).code());
+                assertNotEquals(project, projects.register(owner, List.of(repository), "New", "new-project-key", "new-hash").id());
+                assertThrows(RuntimeException.class, () -> jobs.heartbeat(execution));
+            } finally {
+                http.stop(0);
+            }
+        }
+    }
+
+    @Test void deletingProjectDuringX01VerificationRejectsSnapshot() throws Exception {
+        Fixture f = fixture(1);
+        worker.runJob(f.job());
+        assertEquals("READY", state(f));
+        doAnswer(call -> {
+            var proof = client.verify(call.getArgument(0));
+            deletions.request(owner, f.project());
+            return proof;
+        }).when(verifier).verify(anyList());
+        assertInterviewError(f, "", "owner", X01_KEY, 409, "project_unavailable");
+        assertEquals("DELETING", get("/api/projects/" + f.project()).path("projectStatus").asText());
+    }
+
+    @Test void projectDeletionLeaseBlocksOtherInstancesAndIgnoresLateFailure() throws Exception {
+        Fixture f = fixture(1);
+        var pending = deletions.request(owner, f.project());
+        var requests = new AtomicInteger();
+        var firstEntered = new CountDownLatch(1);
+        var releaseFirst = new CountDownLatch(1);
+        try (var threads = Executors.newVirtualThreadPerTaskExecutor()) {
+            var http = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            http.setExecutor(threads);
+            http.createContext("/", exchange -> {
+                try (exchange) {
+                    var command = json.readTree(exchange.getRequestBody());
+                    if (!pending.deletionJobId().toString().equals(command.path("deletionJobId").asText())) {
+                        exchange.sendResponseHeaders(409, -1);
+                        return;
+                    }
+                    if (requests.incrementAndGet() == 1) {
+                        firstEntered.countDown();
+                        try { releaseFirst.await(5, TimeUnit.SECONDS); }
+                        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                        exchange.sendResponseHeaders(503, -1);
+                    } else {
+                        exchange.sendResponseHeaders(204, -1);
+                    }
+                }
+            });
+            http.start();
+            try {
+                var client = new InterviewDeletionClient("http://127.0.0.1:" + http.getAddress().getPort(),
+                        "x02-dedicated-loopback-key-for-tests", 8);
+                var first = threads.submit(() -> new ProjectDeletions(db, tx, client, 1).poll());
+                assertTrue(firstEntered.await(5, TimeUnit.SECONDS));
+                new ProjectDeletions(db, tx, client, 1).poll();
+                assertEquals(1, requests.get());
+                // Expire the persisted claim as if the first instance had stopped responding.
+                runDeletion(f.project(), client);
+                assertEquals(2, requests.get());
+                assertEquals(204, deleteProject(f.project(), "owner").statusCode());
+                releaseFirst.countDown();
+                first.get(5, TimeUnit.SECONDS);
+                assertNull(deletionFailure(f.project()));
+                assertEquals(204, deleteProject(f.project(), "owner").statusCode());
+            } finally {
+                releaseFirst.countDown();
+                http.stop(0);
+            }
+        }
+    }
+
+    @Test void p03ReturnsRedactedDeletionStateWhenPublicVerificationRaces() throws Exception {
+        Fixture f = fixture(1);
+        worker.runJob(f.job());
+        assertEquals("READY", state(f));
+        doAnswer(call -> {
+            deletions.request(owner, f.project());
+            throw new GitHubSourceClient.Failure("github_unavailable");
+        }).when(verifier).verify(anyList());
+        var result = get("/api/projects/" + f.project());
+        assertEquals("DELETING", result.path("projectStatus").asText());
+        assertTrue(result.path("latestReadySnapshot").isNull());
+        assertTrue(result.path("repositories").get(0).path("commitSha").isNull());
+    }
+
+    @Test void deletingProjectJustBeforeSnapshotPublicationDiscardsLateWorkerResult() {
+        Fixture f = fixture(1);
+        doAnswer(call -> {
+            var proof = client.verify(call.getArgument(0));
+            deletions.request(owner, f.project());
+            return proof;
+        }).when(verifier).verify(anyList());
+        assertTrue(worker.runJob(f.job()));
+        assertEquals("CANCELLED", state(f));
+        assertEquals(0, countProjectRows("analysis_snapshot", f.project()));
+        assertEquals(0, countProjectRows("analysis_repository_checkpoint", f.project()));
+    }
+
+    private HttpResponse<String> deleteProject(UUID project, String token) throws Exception {
+        return HttpClient.newHttpClient().send(HttpRequest.newBuilder(
+                URI.create("http://127.0.0.1:" + port + "/api/projects/" + project))
+                .header("Authorization", "Bearer " + token).DELETE().build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    private UUID queuedJob(UUID project) {
+        UUID job = UUID.randomUUID();
+        db.update("""
+                INSERT INTO project.analysis_job(id,project_id,trigger_kind,state,analysis_version,repository_progress)
+                SELECT ?,?,'USER_REANALYZE','QUEUED','v1',
+                       jsonb_agg(jsonb_build_object('repositoryId',id,'state','QUEUED'))
+                FROM project.project_repository WHERE project_id=? AND removed_at IS NULL
+                """, job, project, project);
+        return job;
+    }
+
+    private void seedTemporaryAnalysis(UUID project, UUID job) {
+        db.update("""
+                INSERT INTO project.analysis_repository_checkpoint(analysis_job_id,project_id,project_repository_id,
+                    membership_version,github_repository_id,commit_sha,analysis_version,analyzer_policy_version,
+                    completed_file_count,completed_bytes,draft,expires_at)
+                SELECT ?,project_id,id,1,github_repository_id,?,'v1','fixture',1,1,
+                    '{"members":[{}],"coverage":[{}],"evidence":[],"topics":[],"roles":[],"relations":[]}'::jsonb,
+                    clock_timestamp()+interval '1 hour'
+                FROM project.project_repository WHERE project_id=? AND github_repository_id='42'
+                """, job, MockSourceServer.SHA, project);
+        db.update("""
+                INSERT INTO project.analysis_file_progress(analysis_job_id,project_id,project_repository_id,
+                    membership_version,github_repository_id,commit_sha,blob_sha,file_path,expected_bytes,
+                    policy_version,attempt_count,download_count,state,expires_at)
+                SELECT ?,project_id,id,1,github_repository_id,?,?,'src/App.java',1,'fixture',1,1,'RESERVED',
+                    clock_timestamp()+interval '1 hour'
+                FROM project.project_repository WHERE project_id=? AND github_repository_id='42'
+                """, job, MockSourceServer.SHA, MockSourceServer.SHA, project);
+    }
+
+    private int countProjectRows(String table, UUID project) {
+        return db.queryForObject("SELECT count(*) FROM project." + table + " WHERE project_id=?", Integer.class, project);
+    }
+
+    private String deletionFailure(UUID project) {
+        return db.queryForObject("SELECT deletion_failure_code FROM project.project_write_fence WHERE project_id=?",
+                String.class, project);
+    }
+
+    private void runDeletion(UUID project, InterviewDeletionClient receiver) {
+        db.update("UPDATE project.project_write_fence SET deletion_next_attempt_at=clock_timestamp() WHERE project_id=?", project);
+        // A fresh processor has no in-memory state from the previous attempt.
+        new ProjectDeletions(db, tx, receiver, 1).poll();
     }
 
     @Test void privateTransitionAndOutageHideSnapshotAndSha() throws Exception {

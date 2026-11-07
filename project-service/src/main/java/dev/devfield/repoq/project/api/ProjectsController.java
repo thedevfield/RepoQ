@@ -2,6 +2,7 @@ package dev.devfield.repoq.project.api;
 
 import tools.jackson.databind.JsonNode;
 import dev.devfield.repoq.project.data.Projects;
+import dev.devfield.repoq.project.deletion.ProjectDeletions;
 import dev.devfield.repoq.project.analysis.ProjectAnalysisReads;
 import dev.devfield.repoq.project.github.GitHubRepositoryClient;
 import dev.devfield.repoq.project.github.GitHubConnections;
@@ -44,18 +45,20 @@ public class ProjectsController {
     private final GitHubRepositoryClient github;
     private final Projects projects;
     private final ProjectAnalysisReads reads;
+    private final ProjectDeletions deletions;
     private final GitHubConnections connections;
     private final boolean privateEnabled;
     private final String policyVersion;
 
     public ProjectsController(AuthSessionVerifier sessions, GitHubRepositoryClient github, Projects projects,
-                              GitHubConnections connections, ProjectAnalysisReads reads,
+                              GitHubConnections connections, ProjectAnalysisReads reads, ProjectDeletions deletions,
                               @Value("${devfield.project.github.private-registration-enabled:false}") String enabled,
                               @Value("${devfield.project.github.private-consent-policy-version:}") String policyVersion) {
         this.sessions = sessions;
         this.github = github;
         this.projects = projects;
         this.reads = reads;
+        this.deletions = deletions;
         this.connections = connections;
         this.privateEnabled = "true".equals(enabled);
         this.policyVersion = policyVersion;
@@ -129,6 +132,14 @@ public class ProjectsController {
         var repositories = fetch(owner, normalized);
         var result = projects.addMixed(owner, id, repositories, safeKey, hash);
         return ResponseEntity.status(HttpStatus.CREATED).body(result);
+    }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<ProjectDeletions.Pending> delete(@RequestHeader("Authorization") String bearer,
+                                                           @AuthenticationPrincipal Jwt jwt, @PathVariable UUID id) {
+        sessions.verify(bearer);
+        var pending = deletions.request(UUID.fromString(jwt.getSubject()), id);
+        return pending == null ? ResponseEntity.noContent().build() : ResponseEntity.accepted().body(pending);
     }
 
     @DeleteMapping("/{id}/repositories/{memberId}")
