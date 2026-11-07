@@ -9,13 +9,22 @@ import org.springframework.jdbc.core.JdbcTemplate;
 public final class ProjectWriteFence {
     private ProjectWriteFence() {}
 
+    public record UserFence(String state, UUID deletionJobId) {
+        public boolean active() { return "ACTIVE".equals(state); }
+    }
+
     public static void lockUser(JdbcTemplate db, UUID owner) {
+        if (!lockUserFence(db, owner).active())
+            throw new ApiProblem(HttpStatus.FORBIDDEN, "account_unavailable");
+    }
+
+    public static UserFence lockUserFence(JdbcTemplate db, UUID owner) {
         db.update("INSERT INTO project.project_write_fence(id,scope,owner_user_id,state) " +
                         "VALUES (?,'USER',?,'ACTIVE') ON CONFLICT (owner_user_id) WHERE scope='USER' DO NOTHING",
                 UUID.randomUUID(), owner);
-        String state = db.queryForObject("SELECT state FROM project.project_write_fence " +
-                "WHERE scope='USER' AND owner_user_id=? FOR UPDATE", String.class, owner);
-        if (!"ACTIVE".equals(state)) throw new ApiProblem(HttpStatus.FORBIDDEN, "account_unavailable");
+        return db.queryForObject("SELECT state,deletion_job_id FROM project.project_write_fence " +
+                "WHERE scope='USER' AND owner_user_id=? FOR UPDATE",
+                (rs, n) -> new UserFence(rs.getString(1), rs.getObject(2, UUID.class)), owner);
     }
 
     public static long lockProject(JdbcTemplate db, UUID owner, UUID id) {

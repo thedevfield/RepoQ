@@ -74,9 +74,10 @@ public class ProjectDeletions {
     public void poll() {
         try {
             var due = db.query("""
-                    SELECT owner_user_id, project_id FROM project.project_write_fence
-                    WHERE scope='PROJECT' AND state='DELETING' AND deletion_next_attempt_at<=clock_timestamp()
-                    ORDER BY deletion_next_attempt_at, project_id LIMIT 1
+                    SELECT p.owner_user_id, p.project_id FROM project.project_write_fence p
+                    JOIN project.project_write_fence u ON u.scope='USER' AND u.owner_user_id=p.owner_user_id AND u.state='ACTIVE'
+                    WHERE p.scope='PROJECT' AND p.state='DELETING' AND p.deletion_next_attempt_at<=clock_timestamp()
+                    ORDER BY p.deletion_next_attempt_at, p.project_id LIMIT 1
                     """, (rs, row) -> new Target(rs.getObject(1, UUID.class), rs.getObject(2, UUID.class)));
             if (!due.isEmpty()) process(due.getFirst());
         } catch (RuntimeException failure) {
@@ -116,6 +117,16 @@ public class ProjectDeletions {
         if (!ownsAttempt(lockFence(target), attempt)) return;
         UUID project = target.project();
         UUID owner = target.owner();
+        removeProjectData(db, owner, project);
+        db.update("""
+                UPDATE project.project_write_fence SET state='COMPLETED', completed_at=now(), updated_at=now(),
+                    deletion_next_attempt_at=NULL, deletion_failure_code=NULL
+                WHERE scope='PROJECT' AND project_id=? AND owner_user_id=?
+                """, project, owner);
+    }
+
+    // Call only with the owner fence held and the target project already marked DELETING.
+    static void removeProjectData(JdbcTemplate db, UUID owner, UUID project) {
         int matched = db.update("""
                 UPDATE project.registered_project SET latest_ready_snapshot_id=NULL
                 WHERE id=? AND owner_user_id=? AND state='DELETING'
@@ -128,11 +139,6 @@ public class ProjectDeletions {
         db.update("DELETE FROM project.analysis_job WHERE project_id=?", project);
         db.update("DELETE FROM project.project_repository WHERE project_id=? AND owner_user_id=?", project, owner);
         db.update("DELETE FROM project.registered_project WHERE id=? AND owner_user_id=?", project, owner);
-        db.update("""
-                UPDATE project.project_write_fence SET state='COMPLETED', completed_at=now(), updated_at=now(),
-                    deletion_next_attempt_at=NULL, deletion_failure_code=NULL
-                WHERE scope='PROJECT' AND project_id=? AND owner_user_id=?
-                """, project, owner);
     }
 
     private void retry(Attempt attempt, String code) {

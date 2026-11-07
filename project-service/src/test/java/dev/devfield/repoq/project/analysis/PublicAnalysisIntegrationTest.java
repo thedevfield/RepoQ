@@ -43,10 +43,12 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
         "devfield.project.auth.session-check-uri=http://127.0.0.1:1/internal/auth/session-check",
         "devfield.project.auth.service-key=test-service-key",
         "devfield.project.deletion.poll-interval=PT1H",
+        "devfield.project.deletion.auth-key-sha256=a8ef6f0b564b683fdd80875e39cad44b26c730994b9bca23b024624e34235526",
         "devfield.project.interview-key-sha256=72f151df5dd04aa4638b3f98bf13dd25bae9c980dc88b8afe67487096473fb72"
 })
 class PublicAnalysisIntegrationTest {
     private static final String X01_KEY = "x01-interview-fixture-key-for-tests-only";
+    private static final String X03_KEY = "x03-auth-fixture-key-for-tests-only";
 
     @Autowired JdbcTemplate db;
     @Autowired TransactionTemplate tx;
@@ -440,6 +442,109 @@ class PublicAnalysisIntegrationTest {
                 http.stop(0);
             }
         }
+    }
+
+    @Test void x03RequiresDedicatedAuthCredentialAndIsIdempotent() throws Exception {
+        UUID job = UUID.randomUUID();
+        deletionSiblingOwner = UUID.randomUUID();
+        assertEquals(401, deleteUser(owner, owner, job, "interview", X03_KEY));
+        assertEquals(401, deleteUser(owner, owner, job, "auth", X01_KEY));
+        assertEquals(401, deleteUser(owner, owner, job, "auth", null));
+        assertEquals(400, deleteUser(owner, deletionSiblingOwner, job, "auth", X03_KEY));
+        assertEquals(204, deleteUser(owner, owner, job, "auth", X03_KEY));
+        assertEquals(204, deleteUser(owner, owner, job, "auth", X03_KEY));
+        assertEquals(409, deleteUser(owner, owner, UUID.randomUUID(), "auth", X03_KEY));
+        assertEquals(409, deleteUser(deletionSiblingOwner, deletionSiblingOwner, job, "auth", X03_KEY));
+    }
+
+    @Test void x03TakesOverP06AndRetriesCleanupWithoutReopeningWrites() throws Exception {
+        Fixture f = fixture(1);
+        worker.runJob(f.job());
+        assertEquals("READY", state(f));
+        var pending = deletions.request(owner, f.project());
+        deletionSiblingOwner = UUID.randomUUID();
+        UUID sibling = projects.register(deletionSiblingOwner, new GitHubRepositoryClient.Repository(
+                "42", server.repos.get("42").name, "fixture"), "Other owner").id();
+        Fixture active = fixtureWithOtherIds();
+        var execution = jobs.claim(active.job());
+        assertNotNull(execution);
+        db.update("INSERT INTO project.github_connection(id,devfield_user_id) VALUES (?,?)", UUID.randomUUID(), owner);
+        db.update("INSERT INTO project.repository_consent(id,owner_user_id,github_repository_id,purpose,decision,policy_version) " +
+                "VALUES (?,?,'42','PRIVATE_COLLECTION','GRANTED','test')", UUID.randomUUID(), owner);
+        UUID userJob = UUID.randomUUID();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var requests = new AtomicInteger();
+        String blocker = "project.test_delete_" + UUID.randomUUID().toString().replace("-", "");
+        db.execute("CREATE TABLE " + blocker + " (id uuid REFERENCES project.registered_project(id))");
+        try (var threads = Executors.newVirtualThreadPerTaskExecutor()) {
+            db.update("INSERT INTO " + blocker + " VALUES (?)", f.project());
+            var http = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            http.setExecutor(threads);
+            http.createContext("/", exchange -> {
+                try (exchange) {
+                    requests.incrementAndGet();
+                    entered.countDown();
+                    try { release.await(10, TimeUnit.SECONDS); }
+                    catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                    exchange.sendResponseHeaders(204, -1);
+                }
+            });
+            http.start();
+            try {
+                var client = new InterviewDeletionClient("http://127.0.0.1:" + http.getAddress().getPort(),
+                        "x02-dedicated-loopback-key-for-tests", 12);
+                var poller = new ProjectDeletions(db, tx, client, 1);
+                var inFlight = threads.submit(poller::poll);
+                assertTrue(entered.await(5, TimeUnit.SECONDS));
+                assertEquals(503, deleteUser(owner, owner, userJob, "auth", X03_KEY));
+                assertEquals("DELETING", db.queryForObject("SELECT state FROM project.project_write_fence " +
+                        "WHERE scope='USER' AND owner_user_id=?", String.class, owner));
+                assertEquals(pending.deletionJobId(), db.queryForObject("SELECT deletion_job_id " +
+                        "FROM project.project_write_fence WHERE project_id=?", UUID.class, f.project()));
+                assertThrows(ApiProblem.class, () -> deletions.request(owner, f.project()));
+                assertEquals("CANCELLED", state(active));
+                assertThrows(RuntimeException.class, () -> jobs.heartbeat(execution));
+                release.countDown();
+                inFlight.get(5, TimeUnit.SECONDS);
+                assertEquals(1, countProjectRows("analysis_snapshot", f.project()));
+                runDeletion(f.project(), client);
+                assertEquals(1, requests.get());
+                UUID otherPending = projects.register(deletionSiblingOwner,
+                        new GitHubRepositoryClient.Repository("777", "sample/pending", "fixture"), "Other pending").id();
+                deletions.request(deletionSiblingOwner, otherPending);
+                poller.poll();
+                assertEquals(2, requests.get());
+                assertEquals(0, countProjectRows("project_repository", otherPending));
+                assertEquals(409, deleteUser(owner, owner, UUID.randomUUID(), "auth", X03_KEY));
+            } finally {
+                release.countDown();
+                http.stop(0);
+            }
+        } finally {
+            db.execute("DROP TABLE " + blocker);
+        }
+        assertEquals(204, deleteUser(owner, owner, userJob, "auth", X03_KEY));
+        assertEquals(204, deleteUser(owner, owner, userJob, "auth", X03_KEY));
+        for (String table : List.of("analysis_snapshot", "snapshot_member", "analysis_job", "project_repository"))
+            assertEquals(0, countProjectRows(table, f.project()), table);
+        assertEquals(0, countProjectRows("analysis_job", active.project()));
+        assertEquals(1, countProjectRows("project_repository", sibling));
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM project.github_connection WHERE devfield_user_id=?",
+                Integer.class, owner));
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM project.repository_consent WHERE owner_user_id=?",
+                Integer.class, owner));
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM project.project_write_fence " +
+                "WHERE scope='PROJECT' AND owner_user_id=?", Integer.class, owner));
+    }
+
+    private int deleteUser(UUID path, UUID subject, UUID job, String caller, String key) throws Exception {
+        var request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/internal/users/" + path + "/data"))
+                .header("Content-Type", "application/json").header("X-DevField-Service", caller)
+                .method("DELETE", HttpRequest.BodyPublishers.ofString(json.writeValueAsString(Map.of(
+                        "userId", subject, "deletionJobId", job, "state", "DELETING"))));
+        if (key != null) request.header("X-DevField-Service-Key", key);
+        return HttpClient.newHttpClient().send(request.build(), HttpResponse.BodyHandlers.discarding()).statusCode();
     }
 
     @Test void p03ReturnsRedactedDeletionStateWhenPublicVerificationRaces() throws Exception {

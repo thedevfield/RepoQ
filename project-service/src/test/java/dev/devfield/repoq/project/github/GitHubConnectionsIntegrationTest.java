@@ -5,10 +5,14 @@ import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 import dev.devfield.repoq.project.api.ApiProblem;
+import dev.devfield.repoq.project.deletion.UserProjectDeletion;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -34,6 +38,7 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
 })
 class GitHubConnectionsIntegrationTest {
     @Autowired GitHubConnections service;
+    @Autowired UserProjectDeletion deletion;
     @Autowired JdbcTemplate db;
     @Autowired TokenCipher cipher;
     @Autowired dev.devfield.repoq.project.data.Projects projects;
@@ -47,6 +52,24 @@ class GitHubConnectionsIntegrationTest {
         db.update("DELETE FROM project.github_connection_attempt WHERE devfield_user_id IN (?,?)", user, other);
         db.update("DELETE FROM project.project_write_fence WHERE owner_user_id IN (?,?)", user, other);
         db.update("DELETE FROM project.github_connection WHERE devfield_user_id IN (?,?)", user, other);
+    }
+
+    @Test
+    void callbackCannotSaveTokensAfterUserDeletion() {
+        var start = service.start(user, session);
+        when(github.exchange(eq("code"), anyString(), anyString())).thenAnswer(call -> {
+            deletion.delete(user, UUID.randomUUID());
+            return tokens();
+        });
+        when(github.userId("access-value")).thenReturn(900L);
+
+        assertEquals("account_unavailable", assertThrows(ApiProblem.class,
+                () -> service.callback(user, session, "code", start.proof())).code());
+        assertEquals("account_unavailable", assertThrows(ApiProblem.class,
+                () -> service.start(user, session)).code());
+        for (String table : List.of("github_connection", "github_connection_attempt"))
+            assertEquals(0, db.queryForObject("SELECT count(*) FROM project." + table + " WHERE devfield_user_id=?",
+                    Integer.class, user));
     }
 
     @Test
@@ -268,6 +291,62 @@ class GitHubConnectionsIntegrationTest {
         assertEquals("DISCONNECTED", service.status(user).userAuthorization());
         assertNull(db.queryForObject("SELECT access_token_ciphertext FROM project.github_connection WHERE id=?",
                 String.class, id));
+    }
+
+    @Test
+    void userDeletionWaitsForTokenRefreshAndRemovesConnection() throws Exception {
+        authorize();
+        UUID connectionId = service.status(user).connectionId();
+        UUID deletionJob = UUID.randomUUID();
+        db.update("UPDATE project.github_connection SET installation_state='INSTALLED',installation_id=88," +
+                "token_expires_at=now()-interval '1 second' WHERE id=?", connectionId);
+
+        var refreshPid = new CompletableFuture<Integer>();
+        var releaseRefresh = new CountDownLatch(1);
+        when(github.refresh("refresh-value")).thenAnswer(call -> {
+            refreshPid.complete(db.queryForObject("SELECT pg_backend_pid()", Integer.class));
+            assertTrue(releaseRefresh.await(15, TimeUnit.SECONDS), "token refresh was not released");
+            return new GitHubAppClient.Tokens("new-access", "new-refresh",
+                    Instant.now().plusSeconds(3600), Instant.now().plusSeconds(7200));
+        });
+        when(github.userId("new-access")).thenReturn(900L);
+        when(github.installationAccessible("new-access", 88, 345)).thenReturn(true);
+        when(github.repositories("new-access", 88, 1, 100)).thenReturn(
+                new GitHubAppClient.RepositoryPage(List.of(
+                        new GitHubAppClient.Repository(72, "sample/private", "private", true)), false));
+
+        try (var pool = Executors.newFixedThreadPool(2)) {
+            var refresh = pool.submit(() -> service.privateRepository(user, "72"));
+            try {
+                int blocker = refreshPid.get(5, TimeUnit.SECONDS);
+                var delete = pool.submit(() -> deletion.delete(user, deletionJob));
+                // Observe the actual database lock wait before letting refresh persist its tokens.
+                boolean waiting;
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                do {
+                    waiting = Boolean.TRUE.equals(db.queryForObject("""
+                            SELECT EXISTS(SELECT 1 FROM pg_stat_activity
+                            WHERE ? = ANY(pg_blocking_pids(pid))
+                            AND query LIKE 'SELECT id FROM project.github_connection%FOR UPDATE')
+                            """, Boolean.class, blocker));
+                    if (!waiting) Thread.sleep(20);
+                } while (!waiting && !delete.isDone() && System.nanoTime() < deadline);
+                assertTrue(waiting, "X-03 did not wait for the token refresh row lock");
+                releaseRefresh.countDown();
+                assertEquals(connectionId, refresh.get(5, TimeUnit.SECONDS).connectionId());
+                delete.get(5, TimeUnit.SECONDS);
+            } finally {
+                releaseRefresh.countDown();
+            }
+        }
+
+        verify(github).userId("new-access");
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM project.github_connection " +
+                "WHERE id=? OR devfield_user_id=?", Integer.class, connectionId, user));
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM project.github_connection_attempt " +
+                "WHERE devfield_user_id=?", Integer.class, user));
+        assertEquals("COMPLETED", db.queryForObject("SELECT state FROM project.project_write_fence " +
+                "WHERE scope='USER' AND owner_user_id=? AND deletion_job_id=?", String.class, user, deletionJob));
     }
 
     private void authorize() {

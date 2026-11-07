@@ -6,6 +6,7 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import java.util.UUID;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.http.HttpMethod;
+import org.springframework.security.authorization.AuthorizationDecision;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.oauth2.core.OAuth2Error;
@@ -20,7 +21,7 @@ import org.springframework.security.web.SecurityFilterChain;
 @Configuration
 public class SecurityConfig {
     @Bean
-    SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+    SecurityFilterChain securityFilterChain(HttpSecurity http, UserDeletionCredential deletionCredential) throws Exception {
         return http.csrf(csrf -> csrf.disable())
                 .httpBasic(basic -> basic.disable())
                 .formLogin(form -> form.disable())
@@ -32,6 +33,8 @@ public class SecurityConfig {
                         .requestMatchers("/actuator/health", "/actuator/health/**").permitAll()
                         .requestMatchers("/api/github/webhook").permitAll()
                         .requestMatchers(HttpMethod.GET, "/internal/projects/*/interview-data").authenticated()
+                        .requestMatchers(HttpMethod.DELETE, "/internal/users/*/data")
+                        .access((auth, context) -> new AuthorizationDecision(deletionCredential.permits(context.getRequest())))
                         .requestMatchers("/api/projects", "/api/projects/*",
                                 "/api/projects/*/repositories", "/api/projects/*/repositories/*").authenticated()
                         .requestMatchers("/api/github/connections/start", "/api/github/connections/callback/complete",

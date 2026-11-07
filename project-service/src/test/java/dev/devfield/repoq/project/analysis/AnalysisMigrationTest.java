@@ -75,7 +75,7 @@ class AnalysisMigrationTest {
         var v9Checksums = db.queryForList("SELECT version,checksum FROM project.flyway_schema_history WHERE version IS NOT NULL ORDER BY installed_rank");
         flyway = Flyway.configure().dataSource(source).schemas("project").defaultSchema("project")
                 .locations("classpath:db/migration").load();
-        assertEquals(2, flyway.migrate().migrationsExecuted);
+        assertEquals(3, flyway.migrate().migrationsExecuted);
         assertEquals(0, db.queryForObject("SELECT count(*) FROM project.project_write_fence WHERE " +
                 "deletion_attempt_count<>0 OR deletion_next_attempt_at IS NOT NULL OR deleted_create_key_hash IS NOT NULL", Integer.class));
         assertEquals(40,db.queryForObject("SELECT download_count FROM project.analysis_job WHERE id=?",Integer.class,interrupted));
