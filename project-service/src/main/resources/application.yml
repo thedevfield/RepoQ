@@ -17,6 +17,12 @@ spring:
 devfield:
   project:
     interview-key-sha256: ${PROJECT_X01_INTERVIEW_KEY_SHA256:}
+    deletion:
+      interview-url: ${PROJECT_INTERVIEW_BASE_URL:}
+      service-key: ${PROJECT_X02_SERVICE_KEY:}
+      timeout-seconds: ${PROJECT_X02_TIMEOUT_SECONDS:10}
+      retry-seconds: ${PROJECT_DELETION_RETRY_SECONDS:30}
+      poll-interval: ${PROJECT_DELETION_POLL_INTERVAL:PT2S}
     analysis:
       enabled: ${PROJECT_ANALYSIS_ENABLED:false}
       max-attempts: ${PROJECT_ANALYSIS_MAX_ATTEMPTS:3}

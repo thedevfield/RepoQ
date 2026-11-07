@@ -38,6 +38,14 @@ Persist the first `deletionJobId` for the target and reuse it on every retry, in
 
 Use three independent service keys for X-01 (Interview → Project), X-02 (Project → Interview), and X-04 (Auth → Interview). Configure the SHA-256 hex hashes for the inbound deletion keys as `INTERVIEW_X02_PROJECT_KEY_SHA256` and `INTERVIEW_X04_AUTH_KEY_SHA256`. Production requires HTTPS or an equivalently protected transport path for all three calls. Plain HTTP is limited to local loopback development and tests.
 
+## Project deletion (P-06)
+
+`DELETE /api/projects/{id}` returns `202` with `id`, `projectStatus=DELETING` and the original `deletionJobId` while cleanup is pending. P-03 returns a redacted deletion status. The owner can repeat P-06 for `204` after completion.
+
+Configure `PROJECT_INTERVIEW_BASE_URL` as the fixed Interview origin and `PROJECT_X02_SERVICE_KEY` as the dedicated raw key matching the Interview X-02 hash. Use HTTPS in production and plain HTTP only on loopback for local development. The Project deletion poller resumes independently of the analysis Worker. Tune `PROJECT_X02_TIMEOUT_SECONDS`, `PROJECT_DELETION_RETRY_SECONDS` and `PROJECT_DELETION_POLL_INTERVAL` as needed. A failed call leaves the project in DELETING and records a safe failure code on its fence. Only Interview's 204 permits Project cleanup.
+
+P-06 preserves shared GitHub connections and user/repository consent history. The completed fence retains a hash of the old P-01 idempotency key, if present, to reject a replay that would recreate the deleted project.
+
 ## Local PostgreSQL
 
 The single local Compose entry point is compose.local.yaml. It creates a separate development container and one database with auth, project and interview schemas. The Compose file lives here for local integration only; each service owns only its schema.

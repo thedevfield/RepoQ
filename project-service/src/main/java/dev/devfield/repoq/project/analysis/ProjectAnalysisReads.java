@@ -37,18 +37,32 @@ public class ProjectAnalysisReads {
 
     public List<Projects.Item> list(UUID owner) {
         return projects.list(owner).stream().map(item -> {
-            boolean candidate = Boolean.TRUE.equals(db.queryForObject(
-                    "SELECT latest_ready_snapshot_id IS NOT NULL FROM project.registered_project WHERE id=? AND owner_user_id=?",
-                    Boolean.class, item.id(), owner));
-            if (!candidate) return item;
-            Projects.Detail detail = detail(owner, item.id());
-            return new Projects.Item(item.id(), detail.name(), detail.analysisStatus(), item.repositoryCount(), item.privateRepositoryCount(), false);
-        }).toList();
+            var candidates = db.query("""
+                    SELECT CASE WHEN state='DELETING' THEN 'DELETING'
+                                WHEN latest_ready_snapshot_id IS NOT NULL THEN 'SNAPSHOT' ELSE 'NONE' END
+                    FROM project.registered_project WHERE id=? AND owner_user_id=?
+                    """, (rs, n) -> rs.getString(1), item.id(), owner);
+            if (candidates.isEmpty()) return null;
+            String candidate = candidates.getFirst();
+            if ("DELETING".equals(candidate))
+                return new Projects.Item(item.id(), "Project deleting", "CANCELLED",
+                        item.repositoryCount(), item.privateRepositoryCount(), false);
+            if (!"SNAPSHOT".equals(candidate)) return item;
+            try {
+                Projects.Detail detail = detail(owner, item.id());
+                return new Projects.Item(item.id(), detail.name(), detail.analysisStatus(),
+                        item.repositoryCount(), item.privateRepositoryCount(), false);
+            } catch (ApiProblem failure) {
+                if (failure.status() == HttpStatus.NOT_FOUND) return null;
+                throw failure;
+            }
+        }).filter(Objects::nonNull).toList();
     }
 
     public Projects.Detail detail(UUID owner, UUID project) {
         // Existing ownership/session-facing behavior runs first; no remote lookup for someone else's project.
         Projects.Detail base = projects.detail(owner, project);
+        if ("DELETING".equals(base.projectStatus())) return base;
         Snapshot snapshot = candidate(owner, project, base.membershipVersion());
         Set<PublicAccessVerifier.Source> sourceSet = new LinkedHashSet<>();
         for (var m : base.repositories()) if ("PUBLIC".equals(m.visibility()) && m.commitSha() != null)
@@ -57,15 +71,16 @@ public class ProjectAnalysisReads {
             sourceSet.add(new PublicAccessVerifier.Source(m.repositoryId(), m.githubRepositoryId(), m.commitSha()));
         if (sourceSet.isEmpty()) return base;
         List<PublicAccessVerifier.Source> sources = List.copyOf(sourceSet);
-        PublicAccessVerifier.Proof proof;
-        try {
-            proof = verifier.orElseThrow().verify(sources);
-            if (proof == null || !proof.validFor(sources)) return blocked(base);
-        } catch (RuntimeException denied) { return blocked(base); }
+        PublicAccessVerifier.Proof proof = detailProof(sources);
         return tx.execute(status -> {
             ProjectWriteFence.lockUser(db, owner);
+            var states = db.query("SELECT state FROM project.registered_project WHERE id=? AND owner_user_id=?",
+                    (rs, row) -> rs.getString(1), project, owner);
+            if (states.isEmpty()) throw new ApiProblem(HttpStatus.NOT_FOUND, "project_not_found");
+            if ("DELETING".equals(states.getFirst())) return Projects.deleting(base);
+            if (proof == null || !proof.validFor(sources)) return blocked(base);
             long version = ProjectWriteFence.lockProject(db, owner, project);
-            if (version != base.membershipVersion() || !proof.validFor(sources)) return blocked(base);
+            if (version != base.membershipVersion()) return blocked(base);
             Snapshot current = candidate(owner, project, version);
             if (!Objects.equals(snapshot == null ? null : snapshot.snapshotId(), current == null ? null : current.snapshotId()))
                 return blocked(base);
@@ -92,6 +107,14 @@ public class ProjectAnalysisReads {
             return new Projects.Detail(base.id(), base.name(), base.projectStatus(), safeState, false, current,
                     version, members, false);
         });
+    }
+
+    private PublicAccessVerifier.Proof detailProof(List<PublicAccessVerifier.Source> sources) {
+        try {
+            return verifier.orElseThrow().verify(sources);
+        } catch (RuntimeException denied) {
+            return null;
+        }
     }
 
     public InterviewData interviewData(UUID owner, UUID project) {
