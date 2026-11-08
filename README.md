@@ -38,6 +38,8 @@ The FREE session API is disabled by default. Enable it with `INTERVIEW_SESSIONS_
 
 The first-question worker is also disabled by default. For local tests, enable both `INTERVIEW_SESSIONS_ENABLED` and `INTERVIEW_FIRST_QUESTION_FAKE_ENABLED`. A new FREE session queues one first MAIN question using its pinned topic and code fact. I-03 returns `currentQuestion` when ready or `GENERATION_FAILED` when generation stops. Existing sessions are not queued by the migration. The fake generator makes no model or network calls.
 
+For local Ollama, enable `INTERVIEW_SESSIONS_ENABLED` and `INTERVIEW_FIRST_QUESTION_OLLAMA_ENABLED`. Select one generator. Enabling both Ollama and the fake generator fails startup. The adapter only calls `127.0.0.1` on the configured port (default 11434), with the installed `qwen3.5:4b` model. Use Ollama's local-only mode (`OLLAMA_NO_CLOUD=1`) when starting the Ollama server. The default request timeout is 20 seconds and the maximum is 25 seconds, below the 30-second worker lease.
+
 ## Interview deletion (X-02 / X-04)
 
 Persist the first `deletionJobId` for the target and reuse it on every retry, including after a timeout or lost response. Once a deletion fence binds a target to a job ID, a different job ID for that target returns `409 deletion_conflict`, even after completion. A retry with the original ID returns `204 No Content` once cleanup is committed.
