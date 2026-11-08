@@ -25,6 +25,17 @@ class InterviewLifecycle {
         this.answers = answers;
     }
 
+    boolean delete(UUID owner, UUID session) {
+        return Boolean.TRUE.equals(tx.execute(transaction -> {
+            var target = answers.findTarget(owner, session);
+            if (target.isEmpty() || answers.lockSession(target.get()) == null) return false;
+            return db.update("""
+                    DELETE FROM interview.interview_session
+                    WHERE id=? AND owner_user_id=? AND project_id=? AND mode='FREE'
+                    """, session, owner, target.get().project()) == 1;
+        }));
+    }
+
     Result change(UUID owner, UUID session, Action action) {
         return tx.execute(transaction -> {
             var target = answers.findTarget(owner, session);

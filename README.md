@@ -48,6 +48,8 @@ Set `INTERVIEW_NEXT_BUNDLE_ENABLED=true` with the session, follow-up, evaluation
 
 Set `INTERVIEW_LIFECYCLE_ENABLED=true` with the session flag to enable FREE I-06. PATCH `/api/interviews/{id}` with `PAUSE`, `RESUME` or `END` in the `action` field. Pausing preserves the current position and requeues in-flight generation without refunding consumed attempts. Ending is terminal, cancels unfinished generation and retains saved questions, answers and evaluations for review. I-03 reports `PAUSED` or `ENDED`. New answers and bundles are rejected in these states; already accepted replays retain their existing behavior.
 
+Set `INTERVIEW_SESSION_DELETION_ENABLED=true` with the session flag to enable FREE I-07. `DELETE /api/interviews/{id}` deletes the owner's session and its saved Snapshot, bundles, questions, answers, evaluations and generation jobs. A committed deletion returns `204`. Unknown, already deleted or inaccessible sessions return `404`. If a project or account deletion barrier has already committed and the target row still exists, I-07 returns `409`.
+
 ## Interview deletion (X-02 / X-04)
 
 Persist the first `deletionJobId` for the target and reuse it on every retry, including after a timeout or lost response. Once a deletion fence binds a target to a job ID, a different job ID for that target returns `409 deletion_conflict`, even after completion. A retry with the original ID returns `204 No Content` once cleanup is committed.

@@ -38,6 +38,8 @@ devfield:
       enabled: ${INTERVIEW_NEXT_BUNDLE_ENABLED:false}
     lifecycle:
       enabled: ${INTERVIEW_LIFECYCLE_ENABLED:false}
+    session-deletion:
+      enabled: ${INTERVIEW_SESSION_DELETION_ENABLED:false}
     deletion:
       # Incoming X-02 and X-04 use distinct keys over protected service transport.
       project-key-sha256: ${INTERVIEW_X02_PROJECT_KEY_SHA256:}

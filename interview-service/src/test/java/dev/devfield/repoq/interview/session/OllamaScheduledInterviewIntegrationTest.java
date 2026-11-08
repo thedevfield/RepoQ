@@ -20,6 +20,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -183,6 +184,14 @@ class OllamaScheduledInterviewIntegrationTest {
         MAIN_REPLY.set(null);
         EVALUATION_REPLY.set(null);
         EVALUATION_REQUEST.set(null);
+    }
+
+    @Test
+    void sessionDeletionIsDisabledByDefault() throws Exception {
+        try (var http = HttpClient.newHttpClient()) {
+            UUID id = start(http);
+            assertEquals(403, deleteSession(http, id).statusCode());
+        }
     }
 
     @Test
@@ -577,7 +586,8 @@ class OllamaScheduledInterviewIntegrationTest {
             "devfield.interview.evaluation.poll-ms=3600000",
             "devfield.interview.first-question.poll-ms=3600000",
             "devfield.interview.next-bundle.enabled=true",
-            "devfield.interview.lifecycle.enabled=true"
+            "devfield.interview.lifecycle.enabled=true",
+            "devfield.interview.session-deletion.enabled=true"
     })
     @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
     class EvaluationRaces {
@@ -586,6 +596,7 @@ class OllamaScheduledInterviewIntegrationTest {
         @Autowired BundleEvaluationWorker worker;
         @Autowired FollowUpWorker closingWorker;
         @Autowired FirstQuestionWorker mainWorker;
+        @Autowired InterviewSessions interviewSessions;
 
         @Test
         void thirdFollowUpClosesBundleAndQueuesOnce() throws Exception {
@@ -925,6 +936,183 @@ class OllamaScheduledInterviewIntegrationTest {
             }
         }
 
+        @Test
+        void deletesOnlyTheOwnersFreeSessionAndAllOfItsBundles() throws Exception {
+            port = evaluationPort;
+            try (var http = HttpClient.newHttpClient()) {
+                UUID sibling = start(http, evaluationDecoder, mainWorker::poll);
+                var snapshot = interviewSessions.find(OWNER, sibling).orElseThrow().snapshot();
+                UUID mock = interviewSessions.create(OWNER, PROJECT, InterviewSessions.Mode.MOCK, snapshot).id();
+
+                UUID id = closeNormally(http);
+                EVALUATION_REPLY.set(new Reply(200, evaluation(EVIDENCE, "Saved evaluation.")));
+                worker.poll();
+                String previous = detail(http, id).path("currentBundleId").asText();
+                assertEquals(202, next(http, id, previous, "JAVA").statusCode());
+                mainWorker.poll();
+                String question = detail(http, id).at("/currentQuestion/id").asText();
+                assertEquals(202, submit(http, id, question, "second answer", "bundle-two"));
+                closingWorker.poll();
+                worker.poll();
+                assertEquals(2, detail(http, id).path("completedBundles").asInt());
+                assertLifecycle(http, id, "PAUSE", "PAUSED");
+                assertLifecycle(http, id, "END", "ENDED");
+
+                UUID outsider = UUID.randomUUID();
+                String outsiderToken = "fixture." + outsider + ".signature";
+                when(evaluationDecoder.decode(outsiderToken)).thenReturn(Jwt.withTokenValue(outsiderToken)
+                        .header("alg", "RS256").subject(outsider.toString()).issuedAt(Instant.now().minusSeconds(1))
+                        .expiresAt(Instant.now().plusSeconds(120)).build());
+                var foreign = http.send(request("/api/interviews/" + id)
+                        .setHeader("Authorization", "Bearer " + outsiderToken).DELETE().build(),
+                        HttpResponse.BodyHandlers.ofString());
+                var missing = deleteSession(http, UUID.randomUUID());
+                assertEquals(404, foreign.statusCode());
+                assertEquals(404, missing.statusCode());
+                assertEquals(JSON.readTree(missing.body()), JSON.readTree(foreign.body()));
+                assertEquals(404, deleteSession(http, mock).statusCode());
+                assertEquals(2, evaluationCount(id));
+
+                var deleted = deleteSession(http, id);
+                assertEquals(204, deleted.statusCode(), deleted.body());
+                assertTrue(deleted.body().isEmpty());
+                assertEquals(404, deleteSession(http, id).statusCode());
+                assertEquals(404, http.send(request("/api/interviews/" + id).GET().build(),
+                        HttpResponse.BodyHandlers.discarding()).statusCode());
+                assertSessionDataGone(id);
+                assertEquals("ACTIVE", detail(http, sibling).path("status").asText());
+                assertEquals("MOCK", db.queryForObject(
+                        "SELECT mode FROM interview.interview_session WHERE id=?", String.class, mock));
+                assertEquals(2, db.queryForObject("""
+                        SELECT count(*) FROM interview.interview_write_fence WHERE owner_user_id=? AND state='ACTIVE'
+                        """, Integer.class, OWNER));
+            }
+        }
+
+        @ParameterizedTest @EnumSource(GenerationStage.class)
+        void sessionDeletionFencesLateResultsWithAValidLease(GenerationStage stage) throws Exception {
+            port = evaluationPort;
+            try (var http = HttpClient.newHttpClient(); var executor = Executors.newSingleThreadExecutor()) {
+                var work = prepareGeneration(http, stage);
+                UUID id = work.session();
+                var entered = new CountDownLatch(1);
+                var release = new CountDownLatch(1);
+                work.reply().set(new Reply(200, stage.response("Late result."), entered, release));
+                var running = executor.submit(work.poll());
+                try {
+                    assertTrue(entered.await(5, TimeUnit.SECONDS));
+                    assertWork(work, "RUNNING", 1, true);
+                    assertEquals(204, deleteSession(http, id).statusCode());
+                    assertSessionDataGone(id);
+                } finally {
+                    release.countDown();
+                }
+                running.get(10, TimeUnit.SECONDS);
+                assertSessionDataGone(id);
+            }
+        }
+
+        @ParameterizedTest
+        @CsvSource({"false,false", "false,true", "true,false", "true,true"})
+        void sessionAndScopeDeletionWaitForTheSharedFence(boolean userDeletion, boolean scopeFirst) throws Exception {
+            port = evaluationPort;
+            try (var http = HttpClient.newHttpClient()) {
+                UUID id = closeNormally(http);
+                UUID job = UUID.randomUUID();
+                Callable<Integer> individual = () -> deleteSession(http, id).statusCode();
+                Callable<Integer> scope = () -> delete(http, userDeletion, job);
+                if (scopeFirst) {
+                    String blocker = "interview.test_individual_delete_" + id.toString().replace("-", "");
+                    db.execute("CREATE TABLE " + blocker + " (id uuid REFERENCES interview.interview_session(id))");
+                    try {
+                        db.update("INSERT INTO " + blocker + " VALUES (?)", id);
+                        overlapDeletions("interview_write_fence", "UPDATE", "NEW.deletion_job_id = '" + job + "'",
+                                scope, individual, 503, 409);
+                        assertEquals("DELETING", db.queryForObject("""
+                                SELECT state FROM interview.interview_write_fence WHERE deletion_job_id=? AND scope=?
+                                """, String.class, job, userDeletion ? "USER" : "PROJECT"));
+                        assertEquals(1, evaluationCount(id));
+                    } finally {
+                        db.execute("DROP TABLE " + blocker);
+                    }
+                    assertEquals(204, scope.call());
+                } else {
+                    overlapDeletions("interview_session", "DELETE", "OLD.id = '" + id + "'",
+                            individual, scope, 204, 204);
+                }
+                assertEquals(404, individual.call());
+                assertSessionDataGone(id);
+            }
+        }
+
+        private void overlapDeletions(String table, String operation, String predicate, Callable<Integer> first,
+                                      Callable<Integer> second, int firstStatus, int secondStatus) throws Exception {
+            String gate = "test_delete_gate_" + UUID.randomUUID().toString().replace("-", "");
+            long key = UUID.randomUUID().getLeastSignificantBits();
+            // Hold the leading request inside its transaction, after it acquired the write fences.
+            db.execute("""
+                    CREATE FUNCTION interview.%s() RETURNS trigger LANGUAGE plpgsql AS $$
+                    BEGIN
+                        PERFORM pg_advisory_xact_lock(%d);
+                        RETURN %s;
+                    END;
+                    $$
+                    """.formatted(gate, key, operation.equals("DELETE") ? "OLD" : "NEW"));
+            try {
+                db.execute("""
+                        CREATE TRIGGER %s BEFORE %s ON interview.%s FOR EACH ROW
+                        WHEN (%s) EXECUTE FUNCTION interview.%s()
+                        """.formatted(gate, operation, table, predicate, gate));
+                try (var executor = Executors.newFixedThreadPool(2);
+                     var gateConnection = db.getDataSource().getConnection();
+                     var statement = gateConnection.createStatement()) {
+                    int gatePid;
+                    try (var rows = statement.executeQuery("SELECT pg_backend_pid()")) {
+                        assertTrue(rows.next());
+                        gatePid = rows.getInt(1);
+                    }
+                    statement.execute("SELECT pg_advisory_lock(" + key + ")");
+                    var leading = executor.submit(first);
+                    java.util.concurrent.Future<Integer> trailing;
+                    try {
+                        int leadingPid = awaitBlockedBy(gatePid);
+                        trailing = executor.submit(second);
+                        awaitBlockedBy(leadingPid);
+                    } finally {
+                        statement.execute("SELECT pg_advisory_unlock(" + key + ")");
+                    }
+                    assertEquals(firstStatus, leading.get(10, TimeUnit.SECONDS));
+                    assertEquals(secondStatus, trailing.get(10, TimeUnit.SECONDS));
+                } finally {
+                    db.execute("DROP TRIGGER IF EXISTS " + gate + " ON interview." + table);
+                }
+            } finally {
+                db.execute("DROP FUNCTION interview." + gate + "()");
+            }
+        }
+
+        private int awaitBlockedBy(int blockerPid) throws InterruptedException {
+            long deadline = System.nanoTime() + Duration.ofSeconds(4).toNanos();
+            do {
+                var blocked = db.queryForList("""
+                        SELECT pid FROM pg_stat_activity WHERE ?=ANY(pg_blocking_pids(pid))
+                        """, Integer.class, blockerPid);
+                if (!blocked.isEmpty()) return blocked.getFirst();
+                Thread.sleep(20);
+            } while (System.nanoTime() < deadline);
+            throw new AssertionError("No request blocked on PostgreSQL backend " + blockerPid);
+        }
+
+        private void assertSessionDataGone(UUID id) {
+            assertEquals(0, db.queryForObject("SELECT count(*) FROM interview.interview_session WHERE id=?",
+                    Integer.class, id));
+            for (String table : List.of("question_bundle", "question_turn", "user_answer",
+                    "bundle_evaluation", "first_question_job")) {
+                assertEquals(0, db.queryForObject("SELECT count(*) FROM interview." + table + " WHERE session_id=?",
+                        Integer.class, id), table);
+            }
+        }
+
         private GenerationWork prepareGeneration(HttpClient http, GenerationStage stage) throws Exception {
             return switch (stage) {
                 case MAIN -> new GenerationWork(createSession(http, evaluationDecoder), mainWorker::poll, MAIN_REPLY, stage);
@@ -1134,6 +1322,10 @@ class OllamaScheduledInterviewIntegrationTest {
         var response = lifecycle(http, id, action);
         assertEquals(200, response.statusCode(), response.body());
         assertEquals(expected, JSON.readTree(response.body()).path("status").asText());
+    }
+
+    private HttpResponse<String> deleteSession(HttpClient http, UUID id) throws Exception {
+        return http.send(request("/api/interviews/" + id).DELETE().build(), HttpResponse.BodyHandlers.ofString());
     }
 
     private int delete(HttpClient http, boolean userDeletion, UUID job) throws Exception {
