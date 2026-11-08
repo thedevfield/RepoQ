@@ -1,5 +1,6 @@
 package dev.devfield.repoq.interview.session;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import dev.devfield.repoq.interview.project.ProjectSnapshotClient;
 import dev.devfield.repoq.interview.security.InterviewAuthentication;
 import java.net.URI;
@@ -21,10 +22,11 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 public class InterviewSessionController {
     public record Start(UUID projectId, InterviewSessions.Mode mode, String topicKey) {}
     public record Detail(UUID interviewId, InterviewSessions.Mode mode, String status, String snapshotId,
-                         String topicKey, int completedBundles) {
+                         String topicKey, int completedBundles,
+                         @JsonInclude(JsonInclude.Include.NON_NULL) InterviewSessions.CurrentQuestion currentQuestion) {
         static Detail from(InterviewSessions.Session session) {
             return new Detail(session.id(), session.mode(), session.state(), session.snapshot().snapshotId(),
-                    session.topicKey(), 0);
+                    session.topicKey(), 0, session.currentQuestion());
         }
     }
 

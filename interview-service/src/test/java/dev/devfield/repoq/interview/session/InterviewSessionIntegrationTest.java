@@ -37,6 +37,8 @@ import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
         "devfield.interview.sessions.enabled=true",
+        "devfield.interview.first-question.fake-enabled=true",
+        "devfield.interview.first-question.poll-ms=3600000",
         "devfield.interview.deletion.project-key-sha256=4acb595e5ada8c9a973db7268d56e9ed27bc097157ce781b7ef0ce5ef401e95d",
         "devfield.interview.deletion.auth-key-sha256=9dc1622a4d732fd2b95d9733ff02dbdf1364f60465c4d10a8badcf779cab4c3e"
 })
@@ -52,6 +54,9 @@ class InterviewSessionIntegrationTest {
 
     @LocalServerPort int port;
     @Autowired JdbcTemplate db;
+    @Autowired FirstQuestionWorker worker;
+    @Autowired org.springframework.transaction.support.TransactionTemplate tx;
+    @MockitoSpyBean FakeFirstQuestionGenerator generator;
     @MockitoBean JwtDecoder decoder;
     @MockitoSpyBean ProjectSnapshotClient snapshots;
     @MockitoSpyBean InterviewSessions sessions;
@@ -116,6 +121,191 @@ class InterviewSessionIntegrationTest {
             return Jwt.withTokenValue(value).header("alg", "RS256").subject(parts[1])
                     .issuedAt(Instant.now().minusSeconds(1)).expiresAt(Instant.now().plusSeconds(120)).build();
         });
+    }
+
+    @AfterEach void clearSessions() {
+        db.update("DELETE FROM interview.interview_session WHERE owner_user_id=?", owner);
+    }
+
+    @Test void firstQuestionRetriesWithPinnedEvidenceAndPublishesExactlyOnce() throws Exception {
+        var pinned = (ProjectSnapshot) SNAPSHOT.get();
+        UUID id = startForGeneration("RANDOM");
+        var firstInput = new AtomicReference<FirstQuestionGenerator.Input>();
+        doAnswer(call -> {
+            FirstQuestionGenerator.Input input = call.getArgument(0);
+            if (firstInput.compareAndSet(null, input)) throw new FirstQuestionGenerator.Retryable();
+            assertEquals(firstInput.get(), input);
+            return call.callRealMethod();
+        }).when(generator).generate(any());
+
+        worker.poll();
+        assertEquals("QUEUED", jobState(id));
+        assertEquals("PREPARING", detail(id).path("status").asText());
+        assertEquals(UUID.fromString(pinned.topics().getFirst().primaryEvidenceId()), firstInput.get().evidenceId());
+        assertEquals(pinned.evidenceReferences().getFirst().summary(), firstInput.get().evidenceSummary());
+        SNAPSHOT.set(snapshot(2, "b"));
+        makeDue(id);
+        new FirstQuestionWorker(db, tx, sessions, generator).poll();
+        var ready = detail(id);
+        assertEquals("ACTIVE", ready.path("status").asText());
+        assertEquals(pinned.snapshotId(), ready.path("snapshotId").asText());
+        assertEquals("RANDOM", ready.path("topicKey").asText());
+        assertEquals("JAVA", ready.path("currentQuestion").path("topicKey").asText());
+        assertTrue(ready.path("currentQuestion").path("text").asText().contains(pinned.evidenceReferences().getFirst().summary()));
+        assertFalse(ready.path("currentQuestion").has("evidenceId"));
+        assertEquals(404, get(bearer("fixture", UUID.randomUUID()), id).statusCode());
+        worker.poll();
+        assertEquals(ready, detail(id));
+        verify(generator, times(2)).generate(any());
+        assertEquals(1, PROJECT_CALLS.get());
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"invalid-json", "unbound-evidence", "invalid-pinned-evidence", "retry-exhausted"})
+    void generationFailsClosed(String scenario) throws Exception {
+        UUID id = startForGeneration("JAVA");
+        if ("invalid-pinned-evidence".equals(scenario)) {
+            db.update("UPDATE interview.first_question_job SET evidence_id=? WHERE session_id=?", UUID.randomUUID(), id);
+        } else if ("retry-exhausted".equals(scenario)) {
+            doThrow(new FirstQuestionGenerator.Retryable()).when(generator).generate(any());
+        } else {
+            doReturn("invalid-json".equals(scenario) ? "{" :
+                    "{\"question\":\"What changed?\",\"evidenceId\":\"" + UUID.randomUUID() + "\"}")
+                    .when(generator).generate(any());
+        }
+
+        worker.poll();
+        if ("retry-exhausted".equals(scenario)) {
+            assertEquals("QUEUED", jobState(id));
+            makeDue(id);
+            worker.poll();
+            assertEquals("QUEUED", jobState(id));
+            makeDue(id);
+            worker.poll();
+            verify(generator, times(3)).generate(any());
+        }
+        if ("invalid-pinned-evidence".equals(scenario)) verifyNoInteractions(generator);
+        assertEquals("FAILED", jobState(id));
+        var failed = detail(id);
+        assertEquals("GENERATION_FAILED", failed.path("status").asText());
+        assertFalse(failed.has("currentQuestion"));
+    }
+
+    @Test void expiredAttemptCannotPublishWhileTheNextAttemptIsRunning() throws Exception {
+        UUID id = startForGeneration("JAVA");
+        var firstEntered = new CountDownLatch(1);
+        var secondEntered = new CountDownLatch(1);
+        var releaseFirst = new CountDownLatch(1);
+        var releaseSecond = new CountDownLatch(1);
+        var calls = new AtomicInteger();
+        doAnswer(call -> {
+            FirstQuestionGenerator.Input input = call.getArgument(0);
+            if (calls.incrementAndGet() == 1) {
+                firstEntered.countDown();
+                assertTrue(releaseFirst.await(15, TimeUnit.SECONDS));
+                return "{\"question\":\"Old result\",\"evidenceId\":\"" + input.evidenceId() + "\"}";
+            }
+            secondEntered.countDown();
+            assertTrue(releaseSecond.await(15, TimeUnit.SECONDS));
+            return call.callRealMethod();
+        }).when(generator).generate(any());
+
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var first = executor.submit(worker::poll);
+            try {
+                assertTrue(firstEntered.await(5, TimeUnit.SECONDS));
+                worker.poll();
+                assertEquals(1, calls.get());
+                db.update("UPDATE interview.first_question_job SET lease_until=clock_timestamp(),due_at=clock_timestamp() WHERE session_id=?", id);
+                var second = executor.submit(new FirstQuestionWorker(db, tx, sessions, generator)::poll);
+                assertTrue(secondEntered.await(5, TimeUnit.SECONDS));
+
+                releaseFirst.countDown();
+                first.get(5, TimeUnit.SECONDS);
+                assertTrue(db.queryForObject("""
+                        SELECT state='RUNNING' AND attempt=2 AND lease_until>clock_timestamp()
+                            AND question_id IS NULL AND question_text IS NULL
+                        FROM interview.first_question_job WHERE session_id=?
+                        """, Boolean.class, id));
+                var preparing = detail(id);
+                assertEquals("PREPARING", preparing.path("status").asText());
+                assertFalse(preparing.has("currentQuestion"));
+
+                releaseSecond.countDown();
+                second.get(5, TimeUnit.SECONDS);
+            } finally {
+                releaseFirst.countDown();
+                releaseSecond.countDown();
+            }
+        }
+        assertEquals(2, calls.get());
+        assertEquals("READY", jobState(id));
+        var ready = detail(id);
+        assertEquals("ACTIVE", ready.path("status").asText());
+        assertFalse(ready.path("currentQuestion").path("text").asText().isBlank());
+        assertNotEquals("Old result", ready.path("currentQuestion").path("text").asText());
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void deletionRejectsInFlightQuestionAndCascadesPublishedQuestion(boolean userDeletion) throws Exception {
+        UUID published = startForGeneration("JAVA");
+        worker.poll();
+        assertEquals("READY", jobState(published));
+        UUID late = startForGeneration("JAVA");
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        doAnswer(call -> {
+            entered.countDown();
+            assertTrue(release.await(10, TimeUnit.SECONDS));
+            return call.callRealMethod();
+        }).when(generator).generate(any());
+
+        String blocker = "interview.test_question_" + published.toString().replace("-", "");
+        UUID deletionJob = UUID.randomUUID();
+        db.execute("CREATE TABLE " + blocker + " (id uuid REFERENCES interview.interview_session(id))");
+        try (var executor = Executors.newSingleThreadExecutor()) {
+            db.update("INSERT INTO " + blocker + " VALUES (?)", published);
+            var running = executor.submit(worker::poll);
+            try {
+                assertTrue(entered.await(5, TimeUnit.SECONDS));
+                assertEquals(503, delete(userDeletion, deletionJob).statusCode());
+            } finally { release.countDown(); }
+            running.get(10, TimeUnit.SECONDS);
+            assertEquals("RUNNING", jobState(late));
+            assertNull(db.queryForObject("SELECT question_id FROM interview.first_question_job WHERE session_id=?", UUID.class, late));
+            assertEquals(404, get(bearer("fixture", owner), late).statusCode());
+        } finally {
+            db.execute("DROP TABLE " + blocker);
+        }
+        assertEquals(204, delete(userDeletion, deletionJob).statusCode());
+        assertEquals(404, get(bearer("fixture", owner), published).statusCode());
+        assertEquals(404, get(bearer("fixture", owner), late).statusCode());
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM interview.first_question_job WHERE session_id IN (?,?)",
+                Integer.class, published, late));
+    }
+
+    private UUID startForGeneration(String topic) throws Exception {
+        var created = start(bearer("fixture", owner), "FREE", topic);
+        assertEquals(201, created.statusCode(), created.body());
+        var body = JSON.readTree(created.body());
+        assertEquals("PREPARING", body.path("status").asText());
+        assertFalse(body.has("currentQuestion"));
+        UUID id = UUID.fromString(body.path("interviewId").asText());
+        assertEquals("QUEUED", jobState(id));
+        return id;
+    }
+
+    private JsonNode detail(UUID id) throws Exception {
+        var response = get(bearer("fixture", owner), id);
+        assertEquals(200, response.statusCode(), response.body());
+        return JSON.readTree(response.body());
+    }
+
+    private void makeDue(UUID id) {
+        db.update("UPDATE interview.first_question_job SET due_at=clock_timestamp() WHERE session_id=?", id);
+    }
+
+    private String jobState(UUID id) {
+        return db.queryForObject("SELECT state FROM interview.first_question_job WHERE session_id=?", String.class, id);
     }
 
     @Test void createsIndependentSessionsAndReadsOnlyThePinnedOwnerMetadata() throws Exception {
@@ -253,7 +443,10 @@ class InterviewSessionIntegrationTest {
     }
 
     private HttpResponse<String> delete(boolean userDeletion) throws Exception {
-        UUID job = UUID.randomUUID();
+        return delete(userDeletion, UUID.randomUUID());
+    }
+
+    private HttpResponse<String> delete(boolean userDeletion, UUID job) throws Exception {
         Map<String, ?> command = userDeletion
                 ? Map.of("userId", owner, "deletionJobId", job, "state", "DELETING")
                 : Map.of("ownerUserId", owner, "projectId", project, "deletionJobId", job);

@@ -7,6 +7,8 @@ import java.time.OffsetDateTime;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
@@ -18,8 +20,11 @@ import org.springframework.transaction.support.TransactionTemplate;
 public class InterviewSessions {
     public enum Mode { FREE, MOCK }
 
+    public record CurrentQuestion(UUID id, String text, String topicKey) {}
+
     public record Session(UUID id, UUID ownerUserId, UUID projectId, ProjectSnapshot snapshot,
-                          Mode mode, String state, String topicKey, long version, OffsetDateTime createdAt) {}
+                          Mode mode, String state, String topicKey, long version, OffsetDateTime createdAt,
+                          CurrentQuestion currentQuestion) {}
 
     public static final class WriteBlocked extends RuntimeException {}
     public static final class DeletionConflict extends RuntimeException {}
@@ -33,9 +38,13 @@ public class InterviewSessions {
     private final TransactionTemplate writes;
     private final TransactionTemplate deletion;
     private final ObjectMapper json = new ObjectMapper();
+    private final boolean generateFirstQuestion;
 
-    public InterviewSessions(JdbcTemplate db, PlatformTransactionManager manager) {
+    public InterviewSessions(JdbcTemplate db, PlatformTransactionManager manager,
+            @Value("${devfield.interview.sessions.enabled:false}") boolean sessionsEnabled,
+            @Value("${devfield.interview.first-question.fake-enabled:false}") boolean fakeEnabled) {
         this.db = db;
+        generateFirstQuestion = sessionsEnabled && fakeEnabled;
         writes = new TransactionTemplate(manager);
         deletion = new TransactionTemplate(manager);
         deletion.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
@@ -51,8 +60,7 @@ public class InterviewSessions {
         UUID snapshotId = UUID.fromString(snapshot.snapshotId());
         String context = encode(snapshot);
         return writes.execute(status -> {
-            if (!lockUser(owner).active()) throw new WriteBlocked();
-            if (!lockProject(owner, project).active()) throw new WriteBlocked();
+            lockActiveScope(owner, project);
             OffsetDateTime created = db.queryForObject("""
                     INSERT INTO interview.interview_session
                         (id, owner_user_id, project_id, mode, snapshot_id, membership_version, snapshot_context, requested_topic_key)
@@ -60,22 +68,36 @@ public class InterviewSessions {
                     RETURNING created_at
                     """, OffsetDateTime.class, id, owner, project, mode.name(), snapshotId,
                     snapshot.membershipVersion(), context, topicKey);
-            return new Session(id, owner, project, snapshot, mode, "PREPARING", topicKey, 1, created);
+            if (generateFirstQuestion && mode == Mode.FREE && topicKey != null) {
+                var topics = snapshot.topics();
+                var resolved = "RANDOM".equals(topicKey)
+                        ? topics.get(ThreadLocalRandom.current().nextInt(topics.size()))
+                        : topics.stream().filter(topic -> topic.key().equals(topicKey)).findFirst().orElseThrow();
+                db.update("""
+                        INSERT INTO interview.first_question_job(session_id,resolved_topic_key,evidence_id)
+                        VALUES (?,?,?)
+                        """, id, resolved.key(), UUID.fromString(resolved.primaryEvidenceId()));
+            }
+            return new Session(id, owner, project, snapshot, mode, "PREPARING", topicKey, 1, created, null);
         });
     }
 
     public Optional<Session> find(UUID owner, UUID sessionId) {
         return db.query("""
                 SELECT s.id, s.owner_user_id, s.project_id, s.snapshot_context::text, s.mode,
-                       s.state, s.requested_topic_key, s.version, s.created_at
+                       s.state, s.requested_topic_key, s.version, s.created_at,
+                       j.question_id, j.question_text, j.resolved_topic_key
                 FROM interview.interview_session s
+                LEFT JOIN interview.first_question_job j ON j.session_id=s.id AND j.state='READY'
                 JOIN interview.interview_write_fence u ON u.scope='USER' AND u.owner_user_id=s.owner_user_id
                 JOIN interview.interview_write_fence p ON p.scope='PROJECT' AND p.project_id=s.project_id
                     AND p.owner_user_id=s.owner_user_id
                 WHERE s.id=? AND s.owner_user_id=? AND u.state='ACTIVE' AND p.state='ACTIVE'
                 """, (rs, row) -> new Session(rs.getObject(1, UUID.class), rs.getObject(2, UUID.class),
                 rs.getObject(3, UUID.class), decode(rs.getString(4)), Mode.valueOf(rs.getString(5)),
-                rs.getString(6), rs.getString(7), rs.getLong(8), rs.getObject(9, OffsetDateTime.class)), sessionId, owner).stream().findFirst();
+                rs.getString(6), rs.getString(7), rs.getLong(8), rs.getObject(9, OffsetDateTime.class),
+                rs.getObject(10, UUID.class) == null ? null : new CurrentQuestion(rs.getObject(10, UUID.class),
+                        rs.getString(11), rs.getString(12))), sessionId, owner).stream().findFirst();
     }
 
     public void deleteProject(UUID owner, UUID project, UUID job) {
@@ -116,6 +138,10 @@ public class InterviewSessions {
             db.update("UPDATE interview.interview_write_fence SET state='COMPLETED', completed_at=now() WHERE id=?",
                     fence.id());
         });
+    }
+
+    void lockActiveScope(UUID owner, UUID project) {
+        if (!lockUser(owner).active() || !lockProject(owner, project).active()) throw new WriteBlocked();
     }
 
     private Fence lockDeletionScope(UUID owner, UUID project) {
