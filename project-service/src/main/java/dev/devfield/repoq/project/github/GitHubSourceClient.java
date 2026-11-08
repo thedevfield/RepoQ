@@ -16,11 +16,13 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.Consumer;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
-/** Anonymous API only. Never accepts an authorization header, user token or repository-supplied URL. */
+/** Public collection on a fixed GitHub origin. Repository access proofs always use anonymous metadata. */
 @Component
 @ConditionalOnProperty(name = "devfield.project.analysis.source-enabled", havingValue = "true", matchIfMissing = true)
 public class GitHubSourceClient implements PublicAccessVerifier {
@@ -60,33 +62,52 @@ public class GitHubSourceClient implements PublicAccessVerifier {
     }
 
     public synchronized List<Target> batch(List<Target> pending, Budget budget) {
-        int capacity = Math.min(budget.remaining, availableRequests());
+        int anonymousCapacity = anonymous.availableRequests();
+        int sourceCapacity = sourceQuota.availableRequests();
         List<Target> selected = new ArrayList<>();
-        int minimum = 0;
+        int minimum = 0, proofCalls = 0, sourceCalls = 0;
+        int proofsPerTarget = 4; // Repository metadata, public commit, collection access and checkpoint.
         for (Target target : pending) {
             int cost = target.commitSha() == null ? 7 : 6; // preparation + collection access + checkpoint refresh + one blob
-            if (minimum + cost > capacity) break;
-            minimum += cost; selected.add(target);
+            if (minimum + cost > budget.remaining || (sourceQuota == anonymous
+                    ? minimum + cost > anonymousCapacity
+                    : proofCalls + proofsPerTarget > anonymousCapacity || sourceCalls + cost - proofsPerTarget > sourceCapacity)) break;
+            minimum += cost;
+            proofCalls += proofsPerTarget;
+            sourceCalls += cost - proofsPerTarget;
+            selected.add(target);
         }
         if (!pending.isEmpty() && selected.isEmpty()) {
             if (budget.remaining < (pending.getFirst().commitSha() == null ? 7 : 6))
                 throw new Failure("analysis_window_complete", 1);
-            throw new Failure("github_rate_limited", rateWaitSeconds(7));
+            int wait = sourceQuota == anonymous ? anonymous.waitSeconds(7)
+                    : Math.max(anonymous.waitSeconds(proofsPerTarget), sourceQuota.waitSeconds(pending.getFirst().commitSha() == null ? 3 : 2));
+            throw new Failure("github_rate_limited", wait);
         }
         return List.copyOf(selected);
     }
 
     public synchronized void publicationCapacity(int members, Budget budget) {
         if (budget.remaining < members) throw new Failure("analysis_window_complete", 1);
-        if (availableRequests() < members) throw new Failure("github_rate_limited", rateWaitSeconds(members));
+        if (anonymous.availableRequests() < members) throw new Failure("github_rate_limited", anonymous.waitSeconds(members));
     }
 
 
     public synchronized List<Plan> fitPlans(List<Plan> plans, Budget budget, int publicationRequests) {
-        int available = Math.min(budget.remaining, availableRequests()) - plans.size() - publicationRequests;
-        long nonempty = plans.stream().filter(p -> !p.files().isEmpty()).count();
-        if (budget.remaining < plans.size() + publicationRequests + nonempty) throw new Failure("analysis_window_complete", 1);
-        if (available < nonempty) throw new Failure("github_rate_limited", rateWaitSeconds(plans.size() + publicationRequests + (int) nonempty));
+        int proofs = plans.size() + publicationRequests;
+        int nonempty = (int) plans.stream().filter(p -> !p.files().isEmpty()).count();
+        int available = budget.remaining - proofs;
+        if (available < nonempty) throw new Failure("analysis_window_complete", 1);
+        if (sourceQuota == anonymous) {
+            available = Math.min(available, anonymous.availableRequests() - proofs);
+            if (available < nonempty) throw new Failure("github_rate_limited", anonymous.waitSeconds(proofs + nonempty));
+        } else {
+            if (anonymous.availableRequests() < proofs)
+                throw new Failure("github_rate_limited", anonymous.waitSeconds(proofs));
+            available = Math.min(available, sourceQuota.availableRequests());
+            if (available < nonempty)
+                throw new Failure("github_rate_limited", sourceQuota.waitSeconds(nonempty));
+        }
         int[] counts = new int[plans.size()];
         // Round-robin allocation keeps an earlier repository from consuming a later member's opportunity.
         for (int round = 0; round < MAX_FILES && available > 0; round++) {
@@ -107,31 +128,58 @@ public class GitHubSourceClient implements PublicAccessVerifier {
         return List.copyOf(result);
     }
 
-    private int availableRequests() {
-        if (!clock.instant().isBefore(resetAt)) { remaining = 60; resetAt = clock.instant().plusSeconds(3600); }
-        return clock.instant().isBefore(blockedUntil) ? 0 : remaining;
-    }
-    private int rateWaitSeconds(int required) {
-        return Math.max(remaining < required ? secondsUntil(resetAt) : 1, secondsUntil(blockedUntil));
+    private final class RateLimit {
+        private final int initial;
+        private int remaining;
+        private Instant resetAt;
+        private Instant blockedUntil = Instant.MIN;
+
+        RateLimit(int initial) {
+            this.initial = initial;
+            remaining = initial;
+            resetAt = clock.instant().plusSeconds(3600);
+        }
+
+        int availableRequests() {
+            Instant now = clock.instant();
+            if (!now.isBefore(resetAt)) {
+                remaining = initial;
+                resetAt = now.plusSeconds(3600);
+            }
+            return now.isBefore(blockedUntil) ? 0 : remaining;
+        }
+
+        int waitSeconds(int required) {
+            return Math.max(remaining < required ? secondsUntil(resetAt) : 1, secondsUntil(blockedUntil));
+        }
     }
     private record Repository(String fullName, String defaultBranch) {}
     private final URI root;
     private final HttpClient http;
     private final Clock clock;
     private final ObjectMapper json = new ObjectMapper();
-    private int remaining = 60;
-    private Instant resetAt, blockedUntil = Instant.MIN;
+    private final String sourceToken;
+    private final RateLimit anonymous;
+    private final RateLimit sourceQuota;
 
-    public GitHubSourceClient() { this(URI.create("https://api.github.com")); }
+    @Autowired
+    public GitHubSourceClient(@Value("${devfield.project.analysis.public-source-token:}") String sourceToken) {
+        this(URI.create("https://api.github.com"), Clock.systemUTC(), sourceToken);
+    }
     // Alternate root is for loopback mock servers, never an application property or repository input.
     public GitHubSourceClient(URI root) { this(root, Clock.systemUTC()); }
-    public GitHubSourceClient(URI root, Clock clock) {
+    public GitHubSourceClient(URI root, Clock clock) { this(root, clock, ""); }
+    public GitHubSourceClient(URI root, Clock clock, String sourceToken) {
         if (!root.equals(URI.create("https://api.github.com")) &&
                 !("http".equals(root.getScheme()) && "127.0.0.1".equals(root.getHost()) && root.getRawUserInfo() == null))
             throw new IllegalArgumentException("Invalid source API origin");
         this.root = root;
         this.clock = clock;
-        this.resetAt = clock.instant().plusSeconds(3600);
+        this.sourceToken = sourceToken.strip();
+        if (!this.sourceToken.matches("[A-Za-z0-9_-]*"))
+            throw new IllegalArgumentException("Invalid public source credential format");
+        this.anonymous = new RateLimit(60);
+        this.sourceQuota = this.sourceToken.isEmpty() ? anonymous : new RateLimit(Integer.MAX_VALUE);
         this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).followRedirects(HttpClient.Redirect.NEVER).build();
     }
 
@@ -173,17 +221,17 @@ public class GitHubSourceClient implements PublicAccessVerifier {
         String commit = target.commitSha();
         if (commit == null) {
             if (repo.defaultBranch() == null || repo.defaultBranch().isBlank()) throw new Failure("empty_repository");
-            JsonNode ref = get(base + "/git/ref/heads/" + segment(repo.defaultBranch()), 65536, budget);
+            JsonNode ref = getSource(base + "/git/ref/heads/" + segment(repo.defaultBranch()), 65536, budget);
             if (!"commit".equals(ref.path("object").path("type").asText())) throw new Failure("invalid_github_response");
             commit = ref.path("object").path("sha").asText();
         }
         if (!sha(commit)) throw new Failure("commit_sha_mismatch");
-        pinned.accept(commit);
         JsonNode object = get(base + "/git/commits/" + commit, 256 * 1024, budget);
         if (!commit.equals(object.path("sha").asText()) || !sha(object.path("tree").path("sha").asText()))
             throw new Failure("commit_sha_mismatch");
+        pinned.accept(commit);
         String treeSha = object.path("tree").path("sha").asText();
-        JsonNode tree = get(base + "/git/trees/" + treeSha + "?recursive=1", 4 * 1024 * 1024, budget);
+        JsonNode tree = getSource(base + "/git/trees/" + treeSha + "?recursive=1", 4 * 1024 * 1024, budget);
         if (!tree.path("truncated").isBoolean() || !treeSha.equals(tree.path("sha").asText()) || !tree.path("tree").isArray())
             throw new Failure("invalid_github_response");
         if (tree.path("truncated").booleanValue()) throw new Failure("tree_truncated");
@@ -247,7 +295,7 @@ public class GitHubSourceClient implements PublicAccessVerifier {
     }
 
     public Download download(Access access, FileEntry entry, Budget budget, Runnable reserve) {
-        JsonNode blob = get("/repos/" + access.fullName() + "/git/blobs/" + entry.sha(), 160 * 1024, budget, reserve);
+        JsonNode blob = get("/repos/" + access.fullName() + "/git/blobs/" + entry.sha(), 160 * 1024, budget, reserve, sourceQuota);
         if (!entry.sha().equals(blob.path("sha").asText()) || !"base64".equals(blob.path("encoding").asText()) ||
                 !blob.path("content").isTextual() || !blob.path("size").canConvertToInt() || blob.path("size").intValue()!=entry.size())
             throw new Failure("invalid_github_response");
@@ -290,46 +338,51 @@ public class GitHubSourceClient implements PublicAccessVerifier {
         return new Repository(name, node.path("default_branch").asText(null));
     }
 
-    private JsonNode get(String path, int maxBytes, Budget budget) { return get(path,maxBytes,budget,()->{}); }
+    private JsonNode get(String path, int maxBytes, Budget budget) {
+        return get(path, maxBytes, budget, () -> {}, anonymous);
+    }
 
-    private JsonNode get(String path, int maxBytes, Budget budget, Runnable reserve) {
+    private JsonNode getSource(String path, int maxBytes, Budget budget) {
+        return get(path, maxBytes, budget, () -> {}, sourceQuota);
+    }
+
+    private JsonNode get(String path, int maxBytes, Budget budget, Runnable reserve, RateLimit quota) {
         if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Source request inside a transaction");
+        int reserved = quota == anonymous ? budget.reserved : 0;
         synchronized (this) {
             // A known remote shortage takes precedence over a local window rollover.
-            if (budget.remaining <= budget.reserved && availableRequests() <= budget.reserved)
-                throw new Failure("github_rate_limited", rateWaitSeconds(budget.reserved + 1));
+            if (budget.remaining <= budget.reserved && quota.availableRequests() <= reserved)
+                throw new Failure("github_rate_limited", quota.waitSeconds(reserved + 1));
         }
         budget.request();
         synchronized (this) {
-            Instant now = clock.instant();
-            if (!now.isBefore(resetAt)) { remaining = 60; resetAt = now.plusSeconds(3600); }
-            if (now.isBefore(blockedUntil)) throw new Failure("github_rate_limited", secondsUntil(blockedUntil));
-            if (remaining <= 0) throw new Failure("github_rate_limited", secondsUntil(resetAt));
-            if (remaining <= budget.reserved) throw new Failure("github_rate_limited", secondsUntil(resetAt));
-            remaining--;
+            if (quota.availableRequests() <= reserved)
+                throw new Failure("github_rate_limited", quota.waitSeconds(reserved + 1));
+            quota.remaining--;
         }
         reserve.run();
         var request = HttpRequest.newBuilder(root.resolve(path)).timeout(Duration.ofSeconds(10))
                 .header("Accept", "application/vnd.github+json").header("X-GitHub-Api-Version", "2022-11-28")
-                .header("User-Agent", "DevField-RepoQ-PublicAnalysis").GET().build();
-        var future = http.sendAsync(request, info -> new LimitedBody(maxBytes));
+                .header("User-Agent", "DevField-RepoQ-PublicAnalysis").GET();
+        if (quota != anonymous) request.header("Authorization", "Bearer " + sourceToken);
+        var future = http.sendAsync(request.build(), info -> new LimitedBody(maxBytes));
         try {
             var response = future.get(10, TimeUnit.SECONDS);
             synchronized (this) {
                 response.headers().firstValue("X-RateLimit-Remaining").ifPresent(v -> {
-                    try { remaining = Math.min(remaining, Math.max(0, Integer.parseInt(v))); } catch (NumberFormatException ignored) { }
+                    try { quota.remaining = Math.min(quota.remaining, Math.max(0, Integer.parseInt(v))); } catch (NumberFormatException ignored) { }
                 });
                 response.headers().firstValue("X-RateLimit-Reset").ifPresent(v -> {
-                    try { Instant reset = Instant.ofEpochSecond(Long.parseLong(v)); if (reset.isAfter(clock.instant())) resetAt = reset; }
+                    try { Instant reset = Instant.ofEpochSecond(Long.parseLong(v)); if (reset.isAfter(clock.instant())) quota.resetAt = reset; }
                     catch (RuntimeException ignored) { }
                 });
                 int status = response.statusCode();
                 if (status == 403 || status == 429) {
                     String message = new String(response.body(), StandardCharsets.UTF_8).toLowerCase(Locale.ROOT);
-                    if (status == 429 || remaining == 0 || response.headers().firstValue("Retry-After").isPresent() || message.contains("rate limit")) {
-                        Instant retry = retryAt(response.headers());
-                        if (retry.isAfter(blockedUntil)) blockedUntil = retry;
-                        throw new Failure("github_rate_limited", secondsUntil(blockedUntil));
+                    if (status == 429 || quota.remaining == 0 || response.headers().firstValue("Retry-After").isPresent() || message.contains("rate limit")) {
+                        Instant retry = retryAt(response.headers(), quota);
+                        if (retry.isAfter(quota.blockedUntil)) quota.blockedUntil = retry;
+                        throw new Failure("github_rate_limited", secondsUntil(quota.blockedUntil));
                     }
                     throw new Failure("github_access_denied");
                 }
@@ -353,7 +406,7 @@ public class GitHubSourceClient implements PublicAccessVerifier {
         } finally { future.cancel(true); }
     }
 
-    private Instant retryAt(HttpHeaders headers) {
+    private Instant retryAt(HttpHeaders headers, RateLimit quota) {
         Instant retry = clock.instant().plusSeconds(60);
         Optional<String> after = headers.firstValue("Retry-After");
         if (after.isPresent()) {
@@ -363,7 +416,7 @@ public class GitHubSourceClient implements PublicAccessVerifier {
                 catch (RuntimeException ignored) { }
             }
         }
-        if (remaining == 0 && resetAt.isAfter(retry)) retry = resetAt;
+        if (quota.remaining == 0 && quota.resetAt.isAfter(retry)) retry = quota.resetAt;
         return retry;
     }
     private int secondsUntil(Instant time) {

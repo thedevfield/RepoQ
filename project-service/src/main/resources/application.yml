@@ -25,6 +25,7 @@ devfield:
       retry-seconds: ${PROJECT_DELETION_RETRY_SECONDS:30}
       poll-interval: ${PROJECT_DELETION_POLL_INTERVAL:PT2S}
     analysis:
+      public-source-token: ${PROJECT_GITHUB_PUBLIC_SOURCE_TOKEN:}
       enabled: ${PROJECT_ANALYSIS_ENABLED:false}
       max-attempts: ${PROJECT_ANALYSIS_MAX_ATTEMPTS:3}
       lease-seconds: ${PROJECT_ANALYSIS_LEASE_SECONDS:60}

@@ -107,6 +107,25 @@ class PublicAnalysisIntegrationTest {
         var registration = projects.register(owner, repos, "Public fixture", null, null);
         return new Fixture(registration.id(), db.queryForObject("SELECT id FROM project.analysis_job WHERE project_id=?", UUID.class, registration.id()));
     }
+    @Test void authenticatedOnlyCommitCannotBePinnedCollectedOrPublished() {
+        Fixture f = fixture(1);
+        var repo = server.repos.get("42");
+        repo.authenticatedOnlyCommit = repo.head;
+        client = server.client("fixture_with_private_access");
+        worker = new AnalysisWorker(settings, jobs, snapshots, Optional.of(client), analyzer);
+
+        assertTrue(worker.runJob(f.job()));
+        assertEquals("FAILED", state(f));
+        assertEquals("github_not_found", db.queryForObject("SELECT failure_code FROM project.analysis_job WHERE id=?", String.class, f.job()));
+        assertFalse(db.queryForObject("SELECT repository_progress::text LIKE ? FROM project.analysis_job WHERE id=?",
+                Boolean.class, "%" + repo.head + "%", f.job()));
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM project.analysis_file_progress WHERE analysis_job_id=?", Integer.class, f.job()));
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM project.analysis_snapshot WHERE project_id=?", Integer.class, f.project()));
+        assertEquals(List.of("/repos/owner/repo42/git/ref/heads/main"), server.authenticatedPaths);
+        assertTrue(server.paths.stream().anyMatch(path -> path.endsWith("/git/commits/" + repo.head)));
+        assertFalse(server.paths.stream().anyMatch(path -> path.contains("/git/trees/") || path.contains("/git/blobs/")));
+    }
+
     String state(Fixture f) { return db.queryForObject("SELECT state FROM project.analysis_job WHERE id=?", String.class, f.job()); }
     JsonNode get(String path) throws Exception {
         var response = call(path, "owner"); assertEquals(200, response.statusCode()); return json.readTree(response.body());
