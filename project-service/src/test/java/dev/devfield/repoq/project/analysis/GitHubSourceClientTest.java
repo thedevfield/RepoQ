@@ -32,6 +32,73 @@ class GitHubSourceClientTest {
         assertEquals("repository_id_mismatch", assertThrows(Failure.class, () -> client.prepare(target(null), 40, TOTAL_BYTES, budget(), sha -> {})).code());
     }
 
+    @Test void credentialIsLimitedToGitObjectsAndUsesAnIndependentQuota() {
+        var repo = server.add("42");
+        var client = server.client("fixture_public_only");
+        var target = target(null);
+        var budget = new Budget(8, () -> {});
+        server.headers.put("X-RateLimit-Remaining", "5");
+        server.authenticatedHeaders.put("X-RateLimit-Remaining", "2");
+        client.batch(List.of(target), budget);
+        var plan = client.prepare(target, 1, TOTAL_BYTES, budget, sha -> {});
+        var access = client.openCollection(plan, budget);
+        plan = client.fitPlans(List.of(plan), budget, 1).getFirst();
+        assertNotNull(client.download(access, plan.files().getFirst(), budget, () -> {}).file());
+        client.checkpointProof(plan, budget);
+        client.publicationCapacity(1, budget);
+        var sources = access.proof().sources().stream().toList();
+        assertTrue(client.verify(sources).validFor(sources));
+        assertEquals(3, server.authenticatedPaths.size());
+        assertTrue(server.authenticatedPaths.stream().allMatch(path -> path.startsWith("/repos/owner/repo42/git/")));
+        assertTrue(server.authenticatedPaths.stream().noneMatch(path -> path.contains("/git/commits/")));
+        assertEquals(1, server.paths.stream().filter(path -> path.contains("/git/commits/")).count());
+        assertEquals(4, server.paths.stream().filter(path -> path.equals("/repositories/42")).count());
+        repo.privateRepo = true;
+        server.resetWindow();
+        assertEquals("repository_not_public", assertThrows(Failure.class, () -> client.verify(sources)).code());
+        assertEquals(3, server.authorizationHeaders.get());
+    }
+
+    @Test void authenticatedQuotaCannotSubstituteForTheAnonymousCommitBudget() {
+        server.add("42");
+        var client = server.client("fixture_public_only");
+        var target = target(null);
+        server.headers.put("X-RateLimit-Remaining", "3");
+        client.verify(List.of(new PublicAccessVerifier.Source(target.repositoryId(), "42", MockSourceServer.SHA)));
+        assertEquals("github_rate_limited", assertThrows(Failure.class, () -> client.batch(List.of(target), budget())).code());
+        assertEquals(List.of("/repositories/42"), server.paths);
+        assertEquals(0, server.authorizationHeaders.get());
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(ints = {403, 429})
+    void sourceThrottleDoesNotThrottleAnonymousProofAndViceVersa(int status) {
+        server.add("42");
+        var client = server.client("fixture_public_only");
+        var target = target(null);
+        var plan = client.prepare(target, 1, TOTAL_BYTES, budget(), sha -> {});
+        var access = client.openCollection(plan, budget());
+        var file = plan.files().getFirst();
+        var sources = access.proof().sources().stream().toList();
+        server.authenticatedStatus = status;
+        server.authenticatedHeaders.put("Retry-After", "90");
+        var limited = assertThrows(Failure.class, () -> client.download(access, file, budget(), () -> {}));
+        assertEquals("github_rate_limited", limited.code());
+        assertEquals(91, limited.retrySeconds());
+        assertTrue(client.verify(sources).validFor(sources));
+
+        server.now.updateAndGet(now -> now.plusSeconds(91));
+        server.authenticatedStatus = 0;
+        server.authenticatedHeaders.clear();
+        server.allStatus = status;
+        server.headers.put("Retry-After", "90");
+        assertEquals("github_rate_limited", assertThrows(Failure.class, () -> client.verify(sources)).code());
+        server.allStatus = 0;
+        server.headers.clear();
+        assertNotNull(client.download(access, file, budget(), () -> {}).file());
+        assertEquals("github_rate_limited", assertThrows(Failure.class, () -> client.verify(sources)).code());
+    }
+
     @Test void decodedSizeCannotExceedDurableReservation() {
         server.add("42"); var client=server.client(); var budget=budget();
         var plan=client.prepare(target(null),40,TOTAL_BYTES,budget,sha->{});

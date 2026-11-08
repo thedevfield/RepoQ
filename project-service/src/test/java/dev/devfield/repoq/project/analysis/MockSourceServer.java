@@ -27,6 +27,7 @@ final class MockSourceServer implements AutoCloseable {
         final String id;
         String name, returnedId, head = SHA;
         boolean privateRepo, truncated, badBlobSha, badCommitSha;
+        String authenticatedOnlyCommit;
         int status;
         String mode = "100644";
         final Map<String, String> files = new LinkedHashMap<>();
@@ -41,6 +42,9 @@ final class MockSourceServer implements AutoCloseable {
     void resetWindow() { now.updateAndGet(t -> t.plusSeconds(3601)); headers.clear(); }
     final Map<String, Repo> repos = new ConcurrentHashMap<>();
     final List<String> paths = Collections.synchronizedList(new ArrayList<>());
+    final List<String> authenticatedPaths = Collections.synchronizedList(new ArrayList<>());
+    final Map<String, String> authenticatedHeaders = new ConcurrentHashMap<>();
+    volatile int authenticatedStatus;
     final AtomicInteger contentRequests = new AtomicInteger(), authorizationHeaders = new AtomicInteger();
     final Map<String, String> headers = new ConcurrentHashMap<>();
     volatile Runnable beforeMetadata = () -> {};
@@ -57,8 +61,13 @@ final class MockSourceServer implements AutoCloseable {
             try {
                 String path = exchange.getRequestURI().getPath(); paths.add(path);
                 if (path.startsWith("/repositories/")) beforeMetadata.run();
-                if (exchange.getRequestHeaders().containsKey("Authorization")) authorizationHeaders.incrementAndGet();
-                Object body = Map.of("message", "SENSITIVE_RESPONSE"); int status = allStatus;
+                boolean authenticated = exchange.getRequestHeaders().containsKey("Authorization");
+                if (authenticated) {
+                    authorizationHeaders.incrementAndGet();
+                    authenticatedPaths.add(path);
+                }
+                Object body = Map.of("message", "SENSITIVE_RESPONSE");
+                int status = authenticated && authenticatedStatus != 0 ? authenticatedStatus : allStatus;
                 Repo repo = null;
                 if (path.startsWith("/repositories/")) repo = repos.get(path.substring("/repositories/".length()));
                 else for (Repo value : repos.values()) if (path.startsWith("/repos/" + value.name + "/")) { repo = value; break; }
@@ -71,7 +80,11 @@ final class MockSourceServer implements AutoCloseable {
                     } else if (path.contains("/git/ref/heads/")) {
                         status = 200; body = Map.of("object", Map.of("type", "commit", "sha", repo.head));
                     } else if (path.contains("/git/commits/")) {
-                        status = 200; body = Map.of("sha", repo.badCommitSha ? "c".repeat(40) : path.substring(path.lastIndexOf('/') + 1), "tree", Map.of("sha", TREE));
+                        String commit = path.substring(path.lastIndexOf('/') + 1);
+                        if (!authenticated && commit.equals(repo.authenticatedOnlyCommit)) status = 404;
+                        else {
+                            status = 200; body = Map.of("sha", repo.badCommitSha ? "c".repeat(40) : commit, "tree", Map.of("sha", TREE));
+                        }
                     } else if (path.contains("/git/trees/")) {
                         List<Map<String, Object>> entries = new ArrayList<>();
                         for (var file : repo.files.entrySet()) {
@@ -97,12 +110,16 @@ final class MockSourceServer implements AutoCloseable {
                 if (status == 0) status = 404;
                 byte[] bytes = rawResponse == null ? json.writeValueAsBytes(body) : rawResponse.getBytes(StandardCharsets.UTF_8);
                 headers.forEach((key, value) -> exchange.getResponseHeaders().set(key, value));
+                if (authenticated) authenticatedHeaders.forEach((key, value) -> exchange.getResponseHeaders().set(key, value));
                 exchange.sendResponseHeaders(status, bytes.length); exchange.getResponseBody().write(bytes);
             } finally { exchange.close(); }
         });
         server.start();
     }
     Repo add(String id) { Repo repo = new Repo(id); repos.put(id, repo); return repo; }
-    GitHubSourceClient client() { return new GitHubSourceClient(URI.create("http://127.0.0.1:" + server.getAddress().getPort()), clock); }
+    GitHubSourceClient client() { return client(""); }
+    GitHubSourceClient client(String token) {
+        return new GitHubSourceClient(URI.create("http://127.0.0.1:" + server.getAddress().getPort()), clock, token);
+    }
     @Override public void close() { server.stop(0); httpExecutor.shutdownNow(); }
 }
