@@ -58,6 +58,7 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
         "devfield.interview.first-question.fake-enabled=false",
         "devfield.interview.first-question.ollama-enabled=true",
         "devfield.interview.first-question.poll-ms=100",
+        "devfield.interview.ollama-long-timeout=PT90S",
         "devfield.interview.follow-up.enabled=true",
         "devfield.interview.follow-up.poll-ms=3600000",
         "devfield.interview.deletion.project-key-sha256=4acb595e5ada8c9a973db7268d56e9ed27bc097157ce781b7ef0ce5ef401e95d",
@@ -510,6 +511,7 @@ class OllamaScheduledInterviewIntegrationTest {
                 try {
                     assertTrue(entered.await(10, TimeUnit.SECONDS));
                     assertHiddenEvaluations(detail(http, id));
+                    assertLongLease("mock_job", "kind='SUMMARY'", id);
                     assertEquals(5, db.queryForObject("""
                             SELECT count(*) FROM interview.bundle_evaluation WHERE session_id=? AND state='READY'
                             """, Integer.class, id));
@@ -601,6 +603,7 @@ class OllamaScheduledInterviewIntegrationTest {
                 assertEquals(202, submit(http, id, question, "I chose simplicity.", "evaluated"));
                 try {
                     assertTrue(entered.await(10, TimeUnit.SECONDS));
+                    assertLongLease("bundle_evaluation", "true", id);
                     var pending = detail(http, id);
                     assertEquals("QUESTIONS_COMPLETE", pending.path("answerProgress").asText());
                     assertEquals("PENDING", pending.path("evaluationStatus").asText());
@@ -1420,6 +1423,7 @@ class OllamaScheduledInterviewIntegrationTest {
                 var running = executor.submit(planner::poll);
                 try {
                     assertTrue(entered.await(5, TimeUnit.SECONDS));
+                    assertLongLease("mock_job", "kind='PLAN'", id);
                     if ("I-07".equals(route)) {
                         assertEquals(409, deleteSession(http, id).statusCode());
                         assertEquals(204, http.send(request("/api/interviews/" + id + "?confirmAbandon=true")
@@ -1641,6 +1645,14 @@ class OllamaScheduledInterviewIntegrationTest {
         private int mockCount(UUID id, String table) {
             return db.queryForObject("SELECT count(*) FROM interview." + table + " WHERE session_id=?", Integer.class, id);
         }
+    }
+
+    private void assertLongLease(String table, String predicate, UUID id) {
+        assertEquals(Boolean.TRUE, db.queryForObject("""
+                SELECT lease_until > clock_timestamp() + interval '90 seconds'
+                    AND abs(extract(epoch from due_at - lease_until)) < 1
+                FROM interview.%s WHERE session_id=? AND state='RUNNING' AND %s
+                """.formatted(table, predicate), Boolean.class, id));
     }
 
     private void assertHiddenEvaluations(JsonNode detail) {

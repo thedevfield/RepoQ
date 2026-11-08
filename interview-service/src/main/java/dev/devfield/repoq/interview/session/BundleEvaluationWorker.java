@@ -113,11 +113,12 @@ class BundleEvaluationWorker {
             return null;
         }
 
+        int leaseSeconds = ollama.longLeaseSeconds();
         var leaseUntil = db.queryForObject("""
                 UPDATE interview.bundle_evaluation SET state='RUNNING',attempt=?,
-                    lease_until=clock_timestamp()+interval '30 seconds',due_at=clock_timestamp()+interval '30 seconds'
+                    lease_until=clock_timestamp()+make_interval(secs=>?),due_at=clock_timestamp()+make_interval(secs=>?)
                 WHERE bundle_id=? RETURNING lease_until
-                """, OffsetDateTime.class, pending.attempt(), job.bundle());
+                """, OffsetDateTime.class, pending.attempt(), leaseSeconds, leaseSeconds, job.bundle());
         return new Claim(job, pending.attempt(), leaseUntil,
                 new FirstQuestionGenerator.Input(pending.topic(), pending.evidence(), evidence.orElseThrow().summary()),
                 turns);

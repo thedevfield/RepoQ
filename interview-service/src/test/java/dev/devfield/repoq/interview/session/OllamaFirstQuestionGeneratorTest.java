@@ -9,6 +9,7 @@ import com.sun.net.httpserver.HttpServer;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -18,6 +19,7 @@ import org.junit.jupiter.api.*;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.convert.ApplicationConversionService;
+import org.springframework.boot.test.context.ConfigDataApplicationContextInitializer;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -135,6 +137,41 @@ class OllamaFirstQuestionGeneratorTest {
 
     @Test void validatesTimeoutBelowWorkerLease() {
         assertThrows(IllegalArgumentException.class, () -> generator(Duration.ofSeconds(30)));
+        int port = server.getAddress().getPort();
+        assertThrows(IllegalArgumentException.class,
+                () -> new OllamaFirstQuestionGenerator(port, TIMEOUT, Duration.ofSeconds(121)));
+        assertEquals(30, generator(TIMEOUT).longLeaseSeconds());
+        assertEquals(105, new OllamaFirstQuestionGenerator(port, TIMEOUT, Duration.ofSeconds(90)).longLeaseSeconds());
+        assertEquals(106, new OllamaFirstQuestionGenerator(port, TIMEOUT, Duration.ofMillis(90001)).longLeaseSeconds());
+    }
+
+    @Test void longOperationsAllowResponsesBeyondTheShortDeadline() {
+        String content = content(input.evidenceId());
+        server.createContext("/api/chat", exchange -> {
+            try (exchange) {
+                Thread.sleep(350);
+                byte[] response = envelope(content, true, "stop");
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, response.length);
+                exchange.getResponseBody().write(response);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        server.start();
+        var generator = new OllamaFirstQuestionGenerator(server.getAddress().getPort(), Duration.ofMillis(150), TIMEOUT);
+        assertThrows(FirstQuestionGenerator.Retryable.class, () -> generator.generate(input));
+        assertThrows(FirstQuestionGenerator.Retryable.class, () -> generator.followUp(input, List.of()));
+        assertEquals(content, generator.evaluate(input, List.of()));
+        assertEquals(content, generator.planMock(List.of()));
+        assertEquals(content, generator.summarizeMock(List.of()));
+    }
+
+    @Test void yamlInheritsTheEffectiveShortTimeoutWhenOnlyThatPropertyIsOverridden() {
+        new ApplicationContextRunner()
+                .withInitializer(new ConfigDataApplicationContextInitializer())
+                .withPropertyValues("devfield.interview.first-question.ollama-timeout=PT25S")
+                .run(app -> assertEquals("PT25S", app.getEnvironment().getProperty("devfield.interview.ollama-long-timeout")));
     }
 
     @Test void optInSelectsOneGeneratorAndRejectsAmbiguity() {
@@ -165,7 +202,7 @@ class OllamaFirstQuestionGeneratorTest {
     }
 
     private OllamaFirstQuestionGenerator generator(Duration timeout) {
-        return new OllamaFirstQuestionGenerator(server.getAddress().getPort(), timeout);
+        return new OllamaFirstQuestionGenerator(server.getAddress().getPort(), timeout, timeout);
     }
 
     static String content(UUID evidenceId) {

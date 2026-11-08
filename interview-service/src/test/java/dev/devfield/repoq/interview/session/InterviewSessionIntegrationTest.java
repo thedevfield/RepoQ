@@ -152,7 +152,7 @@ class InterviewSessionIntegrationTest {
         var pinned = (ProjectSnapshot) SNAPSHOT.get();
         UUID evidence = UUID.fromString(pinned.topics().getFirst().primaryEvidenceId());
         UUID id = startForGeneration("JAVA");
-        var ollama = new OllamaFirstQuestionGenerator(upstream.getAddress().getPort(), Duration.ofSeconds(3));
+        var ollama = new OllamaFirstQuestionGenerator(upstream.getAddress().getPort(), Duration.ofSeconds(3), Duration.ofSeconds(3));
         var ollamaWorker = new FirstQuestionWorker(db, tx, sessions, ollama);
 
         OLLAMA_STATUS.set(503);
