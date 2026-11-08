@@ -53,7 +53,7 @@ class BundleEvaluationWorker {
                 JOIN interview.interview_write_fence u ON u.scope='USER' AND u.owner_user_id=s.owner_user_id AND u.state='ACTIVE'
                 JOIN interview.interview_write_fence p ON p.scope='PROJECT' AND p.project_id=s.project_id
                     AND p.owner_user_id=s.owner_user_id AND p.state='ACTIVE'
-                WHERE s.mode='FREE' AND s.state='ACTIVE' AND e.state IN ('QUEUED','RUNNING')
+                WHERE s.mode='FREE' AND s.lifecycle='OPEN' AND s.state='ACTIVE' AND e.state IN ('QUEUED','RUNNING')
                     AND e.due_at<=clock_timestamp()
                     AND e.bundle_id=(SELECT id FROM interview.question_bundle WHERE session_id=s.id ORDER BY sequence DESC LIMIT 1)
                 ORDER BY e.due_at,e.session_id LIMIT 1

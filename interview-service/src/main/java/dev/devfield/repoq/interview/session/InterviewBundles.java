@@ -38,11 +38,9 @@ class InterviewBundles {
 
     Result request(UUID owner, UUID session, UUID previousBundle, String topic) {
         return tx.execute(status -> {
-            var targets = db.query("""
-                    SELECT project_id FROM interview.interview_session WHERE id=? AND owner_user_id=? AND mode='FREE'
-                    """, (rs, row) -> new InterviewAnswers.Target(session, owner, rs.getObject(1, UUID.class)), session, owner);
-            if (targets.isEmpty()) return new Result(Status.NOT_FOUND);
-            String state = answers.lockSession(targets.getFirst());
+            var target = answers.findTarget(owner, session);
+            if (target.isEmpty()) return new Result(Status.NOT_FOUND);
+            String state = answers.lockSession(target.get());
             if (state == null) return new Result(Status.NOT_FOUND);
 
             var existing = db.query("""

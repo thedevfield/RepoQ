@@ -24,6 +24,7 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 public class InterviewSessionController {
     public record Start(UUID projectId, InterviewSessions.Mode mode, String topicKey) {}
     public record Answer(UUID questionId, String answer, String submissionId) {}
+    public record LifecycleChange(String action) {}
     public record NextBundle(UUID previousBundleId, String topicKey) {}
     public record Detail(UUID interviewId, InterviewSessions.Mode mode, String status, String snapshotId,
                          String topicKey, int completedBundles,
@@ -52,11 +53,14 @@ public class InterviewSessionController {
     private final boolean followUpEnabled;
     private final InterviewBundles bundles;
     private final boolean nextBundleEnabled;
+    private final InterviewLifecycle lifecycle;
+    private final boolean lifecycleEnabled;
 
     public InterviewSessionController(InterviewAuthentication auth, ProjectSnapshotClient snapshots,
-                                      InterviewSessions sessions, InterviewAnswers answers, InterviewBundles bundles,
+                                      InterviewSessions sessions, InterviewAnswers answers, InterviewBundles bundles, InterviewLifecycle lifecycle,
                                       @Value("${devfield.interview.follow-up.enabled:false}") boolean followUpEnabled,
-                                      @Value("${devfield.interview.next-bundle.enabled:false}") boolean nextBundleEnabled) {
+                                      @Value("${devfield.interview.next-bundle.enabled:false}") boolean nextBundleEnabled,
+                                      @Value("${devfield.interview.lifecycle.enabled:false}") boolean lifecycleEnabled) {
         this.auth = auth;
         this.snapshots = snapshots;
         this.sessions = sessions;
@@ -64,6 +68,8 @@ public class InterviewSessionController {
         this.followUpEnabled = followUpEnabled;
         this.bundles = bundles;
         this.nextBundleEnabled = nextBundleEnabled;
+        this.lifecycle = lifecycle;
+        this.lifecycleEnabled = lifecycleEnabled;
     }
 
     @PostMapping("/api/interviews")
@@ -125,6 +131,26 @@ public class InterviewSessionController {
             case NOT_FOUND -> error(404, "interview_not_found");
             case INVALID_TOPIC -> error(400, "invalid_topic");
             case UNAVAILABLE -> error(503, "interview_unavailable");
+        };
+    }
+
+    @PatchMapping("/api/interviews/{id}")
+    public ResponseEntity<?> changeLifecycle(@AuthenticationPrincipal Jwt jwt, @PathVariable UUID id,
+                                              @RequestBody LifecycleChange body) {
+        if (!lifecycleEnabled) return error(403, "interview_unavailable");
+        auth.verify("Bearer " + jwt.getTokenValue());
+        if (body.action() == null) return error(400, "invalid_request");
+        InterviewLifecycle.Action action;
+        try {
+            action = InterviewLifecycle.Action.valueOf(body.action());
+        } catch (IllegalArgumentException invalid) {
+            return error(400, "invalid_request");
+        }
+        var result = lifecycle.change(UUID.fromString(jwt.getSubject()), id, action);
+        return switch (result.outcome()) {
+            case OK -> ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(Map.of("status", result.status()));
+            case CONFLICT -> error(409, "interview_state_conflict");
+            case NOT_FOUND -> error(404, "interview_not_found");
         };
     }
 

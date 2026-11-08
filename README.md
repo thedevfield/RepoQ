@@ -46,6 +46,8 @@ Set `INTERVIEW_EVALUATION_ENABLED=true` with the session, follow-up and Ollama f
 
 Set `INTERVIEW_NEXT_BUNDLE_ENABLED=true` with the session, follow-up, evaluation and Ollama flags to enable FREE I-05. I-03 exposes `currentBundleId`, `completedBundleHistory` and the number of READY evaluations. Submit `previousBundleId` and a pinned Snapshot `topicKey` (or `RANDOM`) to `/api/interviews/{id}/bundles` after the current evaluation is READY. The first request and an identical replay return `202` with the same successor `bundleId`. A different topic for that predecessor or a request before evaluation completes returns `409`.
 
+Set `INTERVIEW_LIFECYCLE_ENABLED=true` with the session flag to enable FREE I-06. PATCH `/api/interviews/{id}` with `PAUSE`, `RESUME` or `END` in the `action` field. Pausing preserves the current position and requeues in-flight generation without refunding consumed attempts. Ending is terminal, cancels unfinished generation and retains saved questions, answers and evaluations for review. I-03 reports `PAUSED` or `ENDED`. New answers and bundles are rejected in these states; already accepted replays retain their existing behavior.
+
 ## Interview deletion (X-02 / X-04)
 
 Persist the first `deletionJobId` for the target and reuse it on every retry, including after a timeout or lost response. Once a deletion fence binds a target to a job ID, a different job ID for that target returns `409 deletion_conflict`, even after completion. A retry with the original ID returns `204 No Content` once cleanup is committed.

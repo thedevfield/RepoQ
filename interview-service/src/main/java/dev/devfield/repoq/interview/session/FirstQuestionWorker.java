@@ -57,7 +57,7 @@ class FirstQuestionWorker {
                 JOIN interview.interview_write_fence u ON u.scope='USER' AND u.owner_user_id=s.owner_user_id AND u.state='ACTIVE'
                 JOIN interview.interview_write_fence p ON p.scope='PROJECT' AND p.project_id=s.project_id
                     AND p.owner_user_id=s.owner_user_id AND p.state='ACTIVE'
-                WHERE s.state='PREPARING' AND j.bundle_id=(SELECT id FROM interview.question_bundle
+                WHERE s.lifecycle='OPEN' AND s.state='PREPARING' AND j.bundle_id=(SELECT id FROM interview.question_bundle
                     WHERE session_id=s.id ORDER BY sequence DESC LIMIT 1) AND j.state IN ('QUEUED','RUNNING') AND j.due_at<=clock_timestamp()
                 ORDER BY j.due_at,j.session_id LIMIT 1
                 """, (rs, row) -> new Target(rs.getObject(1, UUID.class), rs.getObject(2, UUID.class), rs.getObject(3, UUID.class), rs.getObject(4, UUID.class)));
@@ -154,7 +154,7 @@ class FirstQuestionWorker {
         }
         return !db.query("""
                 SELECT id FROM interview.interview_session
-                WHERE id=? AND owner_user_id=? AND project_id=? AND mode='FREE' AND state='PREPARING'
+                WHERE id=? AND owner_user_id=? AND project_id=? AND mode='FREE' AND lifecycle='OPEN' AND state='PREPARING'
                     AND ?=(SELECT id FROM interview.question_bundle WHERE session_id=? ORDER BY sequence DESC LIMIT 1)
                 FOR UPDATE
                 """, (rs, row) -> rs.getObject(1, UUID.class), target.session(), target.owner(), target.project(),
