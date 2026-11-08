@@ -17,18 +17,24 @@ import org.springframework.security.web.SecurityFilterChain;
 @Configuration
 public class SecurityConfig {
     @Bean
-    SecurityFilterChain securityFilterChain(HttpSecurity http, DeletionCredentials credentials) throws Exception {
+    SecurityFilterChain securityFilterChain(HttpSecurity http, DeletionCredentials credentials,
+            @Value("${devfield.interview.sessions.enabled:false}") boolean sessionsEnabled) throws Exception {
         return http.csrf(csrf -> csrf.disable())
                 .httpBasic(basic -> basic.disable())
                 .formLogin(form -> form.disable())
                 .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
-                .authorizeHttpRequests(authorize -> authorize
-                        .requestMatchers("/actuator/health", "/actuator/health/**").permitAll()
+                .authorizeHttpRequests(authorize -> {
+                    if (sessionsEnabled) {
+                        authorize.requestMatchers(HttpMethod.POST, "/api/interviews").authenticated()
+                                .requestMatchers(HttpMethod.GET, "/api/interviews/*").authenticated();
+                    }
+                    authorize.requestMatchers("/actuator/health", "/actuator/health/**").permitAll()
                         .requestMatchers(HttpMethod.DELETE, "/internal/projects/*/interviews")
                         .access((auth, context) -> new AuthorizationDecision(credentials.permitsProject(context.getRequest())))
                         .requestMatchers(HttpMethod.DELETE, "/internal/users/*/data")
                         .access((auth, context) -> new AuthorizationDecision(credentials.permitsAuth(context.getRequest())))
-                        .anyRequest().denyAll())
+                        .anyRequest().denyAll();
+                })
                 .oauth2ResourceServer(oauth -> oauth.jwt(jwt -> {}))
                 .build();
     }
