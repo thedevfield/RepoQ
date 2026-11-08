@@ -7,7 +7,9 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import dev.devfield.repoq.interview.project.ProjectSnapshot;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.EnableScheduling;
@@ -17,8 +19,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 @Component
 @EnableScheduling
-@ConditionalOnProperty(name = {"devfield.interview.sessions.enabled", "devfield.interview.first-question.fake-enabled"},
-        havingValue = "true")
+@ConditionalOnProperty(name = "devfield.interview.sessions.enabled", havingValue = "true")
 class FirstQuestionWorker {
     private static final int MAX_ATTEMPTS = 3;
     private static final JsonMapper JSON = JsonMapper.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
@@ -33,6 +34,12 @@ class FirstQuestionWorker {
     private final InterviewSessions sessions;
     private final FirstQuestionGenerator generator;
 
+    @Autowired
+    FirstQuestionWorker(JdbcTemplate db, TransactionTemplate tx, InterviewSessions sessions,
+                        Optional<FirstQuestionGenerator> generator) {
+        this(db, tx, sessions, generator.orElse(null));
+    }
+
     FirstQuestionWorker(JdbcTemplate db, TransactionTemplate tx, InterviewSessions sessions, FirstQuestionGenerator generator) {
         this.db = db;
         this.tx = tx;
@@ -43,6 +50,7 @@ class FirstQuestionWorker {
     @Scheduled(fixedDelayString = "${devfield.interview.first-question.poll-ms:1000}",
             initialDelayString = "${devfield.interview.first-question.poll-ms:1000}")
     public void poll() {
+        if (generator == null) return;
         List<Target> due = db.query("""
                 SELECT s.id,s.owner_user_id,s.project_id
                 FROM interview.first_question_job j JOIN interview.interview_session s ON s.id=j.session_id

@@ -50,6 +50,9 @@ class InterviewSessionIntegrationTest {
     private static final AtomicInteger PROJECT_STATUS = new AtomicInteger(200);
     private static final AtomicInteger PROJECT_CALLS = new AtomicInteger();
     private static final AtomicReference<String> PROJECT_BEARER = new AtomicReference<>();
+    private static final AtomicReference<JsonNode> OLLAMA_REQUEST = new AtomicReference<>();
+    private static final AtomicInteger OLLAMA_STATUS = new AtomicInteger(200);
+    private static final AtomicReference<UUID> OLLAMA_RESPONSE_EVIDENCE = new AtomicReference<>();
     private static HttpServer upstream;
 
     @LocalServerPort int port;
@@ -100,6 +103,21 @@ class InterviewSessionIntegrationTest {
                 } else exchange.sendResponseHeaders(status, -1);
             }
         });
+        upstream.createContext("/api/chat", exchange -> {
+            try (exchange) {
+                OLLAMA_REQUEST.set(JSON.readTree(exchange.getRequestBody()));
+                int status = OLLAMA_STATUS.get();
+                if (status != 200) {
+                    exchange.sendResponseHeaders(status, -1);
+                    return;
+                }
+                byte[] body = OllamaFirstQuestionGeneratorTest.envelope(
+                        OllamaFirstQuestionGeneratorTest.content(OLLAMA_RESPONSE_EVIDENCE.get()), true, "stop");
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, body.length);
+                exchange.getResponseBody().write(body);
+            }
+        });
         upstream.start();
         String base = "http://127.0.0.1:" + upstream.getAddress().getPort();
         registry.add("devfield.interview.auth.session-check-uri", () -> base + "/internal/auth/session-check");
@@ -112,6 +130,8 @@ class InterviewSessionIntegrationTest {
 
     @BeforeEach void setup() {
         PROJECT_CALLS.set(0);
+        OLLAMA_STATUS.set(200);
+        OLLAMA_REQUEST.set(null);
         PROJECT_STATUS.set(200);
         SNAPSHOT.set(snapshot(1, "a"));
         when(decoder.decode(anyString())).thenAnswer(invocation -> {
@@ -125,6 +145,33 @@ class InterviewSessionIntegrationTest {
 
     @AfterEach void clearSessions() {
         db.update("DELETE FROM interview.interview_session WHERE owner_user_id=?", owner);
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void ollamaHttpRetryKeepsPinnedEvidenceAndWorkerRejectsMismatchedOutput(boolean mismatched) throws Exception {
+        var pinned = (ProjectSnapshot) SNAPSHOT.get();
+        UUID evidence = UUID.fromString(pinned.topics().getFirst().primaryEvidenceId());
+        UUID id = startForGeneration("JAVA");
+        var ollama = new OllamaFirstQuestionGenerator(upstream.getAddress().getPort(), Duration.ofSeconds(3));
+        var ollamaWorker = new FirstQuestionWorker(db, tx, sessions, ollama);
+
+        OLLAMA_STATUS.set(503);
+        ollamaWorker.poll();
+        assertEquals("QUEUED", jobState(id));
+        var firstRequest = OLLAMA_REQUEST.get();
+        assertEquals(evidence.toString(), firstRequest.at("/format/properties/evidenceId/enum/0").asText());
+        SNAPSHOT.set(snapshot(2, "b"));
+        OLLAMA_STATUS.set(200);
+        OLLAMA_RESPONSE_EVIDENCE.set(mismatched ? UUID.randomUUID() : evidence);
+        makeDue(id);
+        ollamaWorker.poll();
+
+        assertEquals(firstRequest, OLLAMA_REQUEST.get());
+        var read = detail(id);
+        assertEquals(pinned.snapshotId(), read.path("snapshotId").asText());
+        assertEquals(mismatched ? "GENERATION_FAILED" : "ACTIVE", read.path("status").asText());
+        assertEquals(!mismatched, read.has("currentQuestion"));
+        assertEquals(1, PROJECT_CALLS.get());
     }
 
     @Test void firstQuestionRetriesWithPinnedEvidenceAndPublishesExactlyOnce() throws Exception {

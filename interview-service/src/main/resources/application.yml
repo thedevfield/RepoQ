@@ -27,6 +27,9 @@ devfield:
       enabled: ${INTERVIEW_SESSIONS_ENABLED:false}
     first-question:
       fake-enabled: ${INTERVIEW_FIRST_QUESTION_FAKE_ENABLED:false}
+      ollama-enabled: ${INTERVIEW_FIRST_QUESTION_OLLAMA_ENABLED:false}
+      ollama-port: ${INTERVIEW_FIRST_QUESTION_OLLAMA_PORT:11434}
+      ollama-timeout: ${INTERVIEW_FIRST_QUESTION_OLLAMA_TIMEOUT:PT20S}
     deletion:
       # Incoming X-02 and X-04 use distinct keys over protected service transport.
       project-key-sha256: ${INTERVIEW_X02_PROJECT_KEY_SHA256:}

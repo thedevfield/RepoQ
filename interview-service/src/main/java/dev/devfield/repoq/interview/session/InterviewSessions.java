@@ -8,7 +8,6 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
@@ -41,10 +40,9 @@ public class InterviewSessions {
     private final boolean generateFirstQuestion;
 
     public InterviewSessions(JdbcTemplate db, PlatformTransactionManager manager,
-            @Value("${devfield.interview.sessions.enabled:false}") boolean sessionsEnabled,
-            @Value("${devfield.interview.first-question.fake-enabled:false}") boolean fakeEnabled) {
+                             Optional<FirstQuestionGenerator> generator) {
         this.db = db;
-        generateFirstQuestion = sessionsEnabled && fakeEnabled;
+        generateFirstQuestion = generator.isPresent();
         writes = new TransactionTemplate(manager);
         deletion = new TransactionTemplate(manager);
         deletion.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
