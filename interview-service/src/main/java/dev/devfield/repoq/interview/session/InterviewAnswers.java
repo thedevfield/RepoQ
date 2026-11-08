@@ -1,5 +1,6 @@
 package dev.devfield.repoq.interview.session;
 
+import java.util.Optional;
 import java.util.UUID;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -29,11 +30,9 @@ class InterviewAnswers {
 
     Result submit(UUID owner, UUID session, UUID question, String answer, String submissionId) {
         return tx.execute(status -> {
-            var targets = db.query("""
-                    SELECT project_id FROM interview.interview_session WHERE id=? AND owner_user_id=? AND mode='FREE'
-                    """, (rs, row) -> new Target(session, owner, rs.getObject(1, UUID.class)), session, owner);
-            if (targets.isEmpty()) return Result.NOT_FOUND;
-            String state = lockSession(targets.getFirst());
+            var target = findTarget(owner, session);
+            if (target.isEmpty()) return Result.NOT_FOUND;
+            String state = lockSession(target.get());
             if (state == null) return Result.NOT_FOUND;
 
             var previous = db.query("""
@@ -75,10 +74,18 @@ class InterviewAnswers {
                 """, UUID.class, session);
     }
 
+    Optional<Target> findTarget(UUID owner, UUID session) {
+        return db.query("""
+                SELECT project_id FROM interview.interview_session WHERE id=? AND owner_user_id=? AND mode='FREE'
+                """, (rs, row) -> new Target(session, owner, rs.getObject(1, UUID.class)), session, owner)
+                .stream().findFirst();
+    }
+
     String lockSession(Target target) {
         sessions.lockActiveScope(target.owner(), target.project());
         return db.query("""
-                SELECT state FROM interview.interview_session WHERE id=? AND owner_user_id=? AND project_id=?
+                SELECT CASE WHEN lifecycle='OPEN' THEN state ELSE lifecycle END
+                FROM interview.interview_session WHERE id=? AND owner_user_id=? AND project_id=?
                     AND mode='FREE' FOR UPDATE
                 """, (rs, row) -> rs.getString(1), target.session(), target.owner(), target.project())
                 .stream().findFirst().orElse(null);

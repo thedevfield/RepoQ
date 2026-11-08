@@ -106,13 +106,15 @@ public class InterviewSessions {
     Optional<Session> find(UUID owner, UUID sessionId, boolean includeHistory) {
         return db.query("""
                 SELECT s.id, s.owner_user_id, s.project_id, s.snapshot_context::text, s.mode,
-                       s.state, bundle.requested_topic_key, s.version, s.created_at,
+                       CASE WHEN s.lifecycle='OPEN' THEN s.state ELSE s.lifecycle END,
+                       bundle.requested_topic_key, s.version, s.created_at,
                        CASE WHEN latest.state IS NULL THEN latest.id END, latest.question_text, latest.topic_key,
                        CASE
                            WHEN latest.id IS NULL THEN NULL
                            WHEN latest.state IS NULL THEN 'AWAITING_ANSWER'
                            WHEN latest.state='STOPPED' THEN 'QUESTIONS_COMPLETE'
                            WHEN latest.state='FAILED' THEN 'FOLLOW_UP_FAILED'
+                           WHEN latest.state='CANCELLED' THEN 'FOLLOW_UP_CANCELLED'
                            ELSE 'FOLLOW_UP_PENDING'
                        END,
                        history.answers::text,

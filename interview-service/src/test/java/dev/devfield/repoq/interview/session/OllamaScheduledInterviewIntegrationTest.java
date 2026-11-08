@@ -31,6 +31,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.builder.SpringApplicationBuilder;
@@ -181,6 +183,14 @@ class OllamaScheduledInterviewIntegrationTest {
         MAIN_REPLY.set(null);
         EVALUATION_REPLY.set(null);
         EVALUATION_REQUEST.set(null);
+    }
+
+    @Test
+    void lifecycleIsDisabledByDefault() throws Exception {
+        try (var http = HttpClient.newHttpClient()) {
+            UUID id = start(http);
+            assertEquals(403, lifecycle(http, id, "PAUSE").statusCode());
+        }
     }
 
     @Test
@@ -566,7 +576,8 @@ class OllamaScheduledInterviewIntegrationTest {
             "devfield.interview.evaluation.enabled=true",
             "devfield.interview.evaluation.poll-ms=3600000",
             "devfield.interview.first-question.poll-ms=3600000",
-            "devfield.interview.next-bundle.enabled=true"
+            "devfield.interview.next-bundle.enabled=true",
+            "devfield.interview.lifecycle.enabled=true"
     })
     @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
     class EvaluationRaces {
@@ -749,6 +760,192 @@ class OllamaScheduledInterviewIntegrationTest {
             }
         }
 
+        @ParameterizedTest @EnumSource(GenerationStage.class)
+        void quickPauseResumeFencesTheEarlierAttempt(GenerationStage stage) throws Exception {
+            port = evaluationPort;
+            try (var http = HttpClient.newHttpClient(); var executor = Executors.newFixedThreadPool(2)) {
+                var work = prepareGeneration(http, stage);
+                UUID id = work.session();
+                var firstEntered = new CountDownLatch(1);
+                var firstRelease = new CountDownLatch(1);
+                var secondEntered = new CountDownLatch(1);
+                var secondRelease = new CountDownLatch(1);
+                work.reply().set(new Reply(200, stage.response("Old result."), firstEntered, firstRelease));
+                var first = executor.submit(work.poll());
+                try {
+                    assertTrue(firstEntered.await(5, TimeUnit.SECONDS));
+                    assertLifecycle(http, id, "PAUSE", "PAUSED");
+                    assertLifecycle(http, id, "PAUSE", "PAUSED");
+                    assertEquals("PAUSED", detail(http, id).path("status").asText());
+                    assertWork(work, "QUEUED", 1, false);
+                    work.poll().run();
+                    assertWork(work, "QUEUED", 1, false);
+                    assertLifecycle(http, id, "RESUME", stage == GenerationStage.MAIN ? "PREPARING" : "ACTIVE");
+                    work.reply().set(new Reply(200, stage.response("New result."), secondEntered, secondRelease));
+                    var second = executor.submit(work.poll());
+                    assertTrue(secondEntered.await(5, TimeUnit.SECONDS));
+                    firstRelease.countDown();
+                    first.get(10, TimeUnit.SECONDS);
+                    assertWork(work, "RUNNING", 2, true);
+                    assertFalse(detail(http, id).has(stage == GenerationStage.EVALUATION ? "evaluation" : "currentQuestion"));
+                    secondRelease.countDown();
+                    second.get(10, TimeUnit.SECONDS);
+                    assertEquals("New result.", detail(http, id).at(stage.resultPath()).asText());
+                } finally {
+                    firstRelease.countDown();
+                    secondRelease.countDown();
+                }
+            }
+        }
+
+        @Test
+        void pausingLastAttemptDoesNotRestoreRetryBudget() throws Exception {
+            port = evaluationPort;
+            try (var http = HttpClient.newHttpClient(); var executor = Executors.newSingleThreadExecutor()) {
+                var work = prepareGeneration(http, GenerationStage.MAIN);
+                UUID id = work.session();
+                db.update("UPDATE interview.first_question_job SET attempt=2 WHERE session_id=?", id);
+                var entered = new CountDownLatch(1);
+                var release = new CountDownLatch(1);
+                work.reply().set(new Reply(200, work.stage().response("Ignored last attempt."), entered, release));
+                var running = executor.submit(work.poll());
+                try {
+                    assertTrue(entered.await(5, TimeUnit.SECONDS));
+                    assertLifecycle(http, id, "PAUSE", "PAUSED");
+                    assertWork(work, "QUEUED", 3, false);
+                    assertLifecycle(http, id, "RESUME", "PREPARING");
+                } finally {
+                    release.countDown();
+                }
+                running.get(10, TimeUnit.SECONDS);
+                work.poll().run();
+                assertWork(work, "FAILED", 3, false);
+                assertEquals("GENERATION_FAILED", detail(http, id).path("status").asText());
+                assertLifecycle(http, id, "PAUSE", "PAUSED");
+                assertLifecycle(http, id, "RESUME", "GENERATION_FAILED");
+                assertLifecycle(http, id, "PAUSE", "PAUSED");
+                assertLifecycle(http, id, "END", "ENDED");
+            }
+        }
+
+        @ParameterizedTest
+        @CsvSource({"MAIN,false", "MAIN,true", "FOLLOW_UP,false", "FOLLOW_UP,true", "EVALUATION,false", "EVALUATION,true"})
+        void deletionBlocksLifecycleAndLateResults(GenerationStage stage, boolean userDeletion) throws Exception {
+            port = evaluationPort;
+            try (var http = HttpClient.newHttpClient(); var executor = Executors.newSingleThreadExecutor()) {
+                var work = prepareGeneration(http, stage);
+                UUID id = work.session();
+                var entered = new CountDownLatch(1);
+                var release = new CountDownLatch(1);
+                work.reply().set(new Reply(200, stage.response("Late result."), entered, release));
+                String blocker = "interview.test_lifecycle_" + id.toString().replace("-", "");
+                UUID job = UUID.randomUUID();
+                db.execute("CREATE TABLE " + blocker + " (id uuid REFERENCES interview.interview_session(id))");
+                try {
+                    db.update("INSERT INTO " + blocker + " VALUES (?)", id);
+                    var running = executor.submit(work.poll());
+                    try {
+                        assertTrue(entered.await(5, TimeUnit.SECONDS));
+                        assertWork(work, "RUNNING", 1, true);
+                        assertEquals(503, delete(http, userDeletion, job));
+                        assertEquals("DELETING", db.queryForObject("""
+                                SELECT state FROM interview.interview_write_fence WHERE deletion_job_id=? AND scope=?
+                                """, String.class, job, userDeletion ? "USER" : "PROJECT"));
+                        for (String action : List.of("PAUSE", "RESUME", "END")) {
+                            assertEquals(409, lifecycle(http, id, action).statusCode());
+                        }
+                        assertEquals(404, http.send(request("/api/interviews/" + id).GET().build(),
+                                HttpResponse.BodyHandlers.discarding()).statusCode());
+                        assertEquals("OPEN", db.queryForObject(
+                                "SELECT lifecycle FROM interview.interview_session WHERE id=?", String.class, id));
+                        assertWork(work, "RUNNING", 1, true);
+                    } finally {
+                        release.countDown();
+                    }
+                    running.get(10, TimeUnit.SECONDS);
+                    assertWork(work, "RUNNING", 1, true);
+                } finally {
+                    db.execute("DROP TABLE " + blocker);
+                }
+                assertEquals(204, delete(http, userDeletion, job));
+                assertEquals(0, db.queryForObject("SELECT count(*) FROM interview." + stage.table + " WHERE session_id=?",
+                        Integer.class, id));
+            }
+        }
+
+        @Test
+        void endingPreservesRecordsAndRejectsNewWritesButAllowsAcceptedReplays() throws Exception {
+            port = evaluationPort;
+            try (var http = HttpClient.newHttpClient(); var executor = Executors.newSingleThreadExecutor()) {
+                UUID id = closeNormally(http);
+                String firstQuestion = detail(http, id).at("/answers/0/questionId").asText();
+                EVALUATION_REPLY.set(new Reply(200, evaluation(EVIDENCE, "First evaluation.")));
+                worker.poll();
+                String predecessor = detail(http, id).path("currentBundleId").asText();
+                assertLifecycle(http, id, "PAUSE", "PAUSED");
+                assertEquals(409, next(http, id, predecessor, "JAVA").statusCode());
+                assertLifecycle(http, id, "RESUME", "ACTIVE");
+                var accepted = next(http, id, predecessor, "JAVA");
+                assertEquals(202, accepted.statusCode(), accepted.body());
+                mainWorker.poll();
+                String question = detail(http, id).at("/currentQuestion/id").asText();
+                assertLifecycle(http, id, "PAUSE", "PAUSED");
+                assertEquals(409, submit(http, id, question, "not accepted", "new"));
+                assertLifecycle(http, id, "RESUME", "ACTIVE");
+                assertEquals(202, submit(http, id, question, "kept answer", "second"));
+                var entered = new CountDownLatch(1);
+                var release = new CountDownLatch(1);
+                FOLLOW_UP_REPLY.set(new Reply(200, GenerationStage.FOLLOW_UP.response("Late after END."), entered, release));
+                var running = executor.submit(closingWorker::poll);
+                try {
+                    assertTrue(entered.await(5, TimeUnit.SECONDS));
+                    assertLifecycle(http, id, "END", "ENDED");
+                    assertLifecycle(http, id, "END", "ENDED");
+                } finally {
+                    release.countDown();
+                }
+                running.get(10, TimeUnit.SECONDS);
+
+                assertEquals(409, lifecycle(http, id, "RESUME").statusCode());
+                assertEquals(409, lifecycle(http, id, "PAUSE").statusCode());
+                assertEquals(409, submit(http, id, question, "changed", "third"));
+                assertEquals(202, submit(http, id, question, "kept answer", "second"));
+                assertEquals(202, submit(http, id, firstQuestion, "saved answer", "evaluation"));
+                var replay = next(http, id, predecessor, "JAVA");
+                assertEquals(202, replay.statusCode());
+                assertEquals(JSON.readTree(accepted.body()), JSON.readTree(replay.body()));
+
+                var ended = detail(http, id);
+                assertEquals("ENDED", ended.path("status").asText());
+                assertEquals("FOLLOW_UP_CANCELLED", ended.path("answerProgress").asText());
+                assertFalse(ended.has("currentQuestion"));
+                assertEquals("kept answer", ended.at("/answers/0/answer").asText());
+                assertEquals("First evaluation.", ended.at("/completedBundleHistory/0/evaluation/strengths").asText());
+                assertEquals(1, ended.path("completedBundles").asInt());
+            }
+        }
+
+        private GenerationWork prepareGeneration(HttpClient http, GenerationStage stage) throws Exception {
+            return switch (stage) {
+                case MAIN -> new GenerationWork(createSession(http, evaluationDecoder), mainWorker::poll, MAIN_REPLY, stage);
+                case FOLLOW_UP -> {
+                    UUID id = start(http, evaluationDecoder, mainWorker::poll);
+                    String question = detail(http, id).at("/currentQuestion/id").asText();
+                    assertEquals(202, submit(http, id, question, "saved answer", "follow"));
+                    yield new GenerationWork(id, closingWorker::poll, FOLLOW_UP_REPLY, stage);
+                }
+                case EVALUATION -> new GenerationWork(closeNormally(http), worker::poll, EVALUATION_REPLY, stage);
+            };
+        }
+
+        private void assertWork(GenerationWork work, String state, int attempt, boolean leased) {
+            var row = db.queryForMap("""
+                    SELECT state,attempt,COALESCE(lease_until > clock_timestamp(), false) AS leased
+                    FROM interview.%s WHERE session_id=?
+                    """.formatted(work.stage().table), work.session());
+            assertEquals(Map.of("state", state, "attempt", attempt, "leased", leased), row);
+        }
+
         private UUID closeNormally(HttpClient http) throws Exception {
             UUID id = start(http, evaluationDecoder, mainWorker::poll);
             String question = detail(http, id).at("/currentQuestion/id").asText();
@@ -824,6 +1021,27 @@ class OllamaScheduledInterviewIntegrationTest {
                                 + environment.getRequiredProperty("devfield.interview.project.service-key"));
     }
 
+    private enum GenerationStage {
+        MAIN("first_question_job"), FOLLOW_UP("user_answer"), EVALUATION("bundle_evaluation");
+
+        private final String table;
+        GenerationStage(String table) { this.table = table; }
+
+        String response(String text) {
+            return switch (this) {
+                case MAIN -> JSON.valueToTree(Map.of("question", text, "evidenceId", EVIDENCE)).toString();
+                case FOLLOW_UP -> outcome("FOLLOW_UP", text, EVIDENCE);
+                case EVALUATION -> evaluation(EVIDENCE, text);
+            };
+        }
+
+        String resultPath() {
+            return this == EVALUATION ? "/evaluation/strengths" : "/currentQuestion/text";
+        }
+    }
+
+    private record GenerationWork(UUID session, Runnable poll, AtomicReference<Reply> reply, GenerationStage stage) {}
+
     private int evaluationCount(UUID id) {
         return db.queryForObject("SELECT count(*) FROM interview.bundle_evaluation WHERE session_id=?", Integer.class, id);
     }
@@ -859,6 +1077,13 @@ class OllamaScheduledInterviewIntegrationTest {
     }
 
     private UUID start(HttpClient http, JwtDecoder jwtDecoder, Runnable afterSubmit) throws Exception {
+        UUID id = createSession(http, jwtDecoder);
+        afterSubmit.run();
+        awaitActive(http, id);
+        return id;
+    }
+
+    private UUID createSession(HttpClient http, JwtDecoder jwtDecoder) throws Exception {
         when(jwtDecoder.decode(TOKEN)).thenReturn(Jwt.withTokenValue(TOKEN).header("alg", "RS256")
                 .subject(OWNER.toString()).issuedAt(Instant.now().minusSeconds(1))
                 .expiresAt(Instant.now().plusSeconds(120)).build());
@@ -867,10 +1092,7 @@ class OllamaScheduledInterviewIntegrationTest {
                         Map.of("projectId", PROJECT, "mode", "FREE", "topicKey", "JAVA")))).build(),
                 HttpResponse.BodyHandlers.ofString());
         assertEquals(201, response.statusCode(), response.body());
-        UUID id = UUID.fromString(JSON.readTree(response.body()).path("interviewId").asText());
-        afterSubmit.run();
-        awaitActive(http, id);
-        return id;
+        return UUID.fromString(JSON.readTree(response.body()).path("interviewId").asText());
     }
 
     private JsonNode awaitActive(HttpClient http, UUID id) throws Exception {
@@ -900,6 +1122,18 @@ class OllamaScheduledInterviewIntegrationTest {
         return http.send(request("/api/interviews/" + id + "/bundles").header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(Map.of(
                         "previousBundleId", previous, "topicKey", topic)))).build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    private HttpResponse<String> lifecycle(HttpClient http, UUID id, String action) throws Exception {
+        return http.send(request("/api/interviews/" + id).header("Content-Type", "application/json")
+                .method("PATCH", HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(Map.of("action", action))))
+                .build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    private void assertLifecycle(HttpClient http, UUID id, String action, String expected) throws Exception {
+        var response = lifecycle(http, id, action);
+        assertEquals(200, response.statusCode(), response.body());
+        assertEquals(expected, JSON.readTree(response.body()).path("status").asText());
     }
 
     private int delete(HttpClient http, boolean userDeletion, UUID job) throws Exception {
