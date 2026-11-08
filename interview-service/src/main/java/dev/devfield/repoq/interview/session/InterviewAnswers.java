@@ -1,6 +1,7 @@
 package dev.devfield.repoq.interview.session;
 
 import java.util.UUID;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -16,10 +17,14 @@ class InterviewAnswers {
     private final TransactionTemplate tx;
     private final InterviewSessions sessions;
 
-    InterviewAnswers(JdbcTemplate db, TransactionTemplate tx, InterviewSessions sessions) {
+    private final boolean evaluationEnabled;
+
+    InterviewAnswers(JdbcTemplate db, TransactionTemplate tx, InterviewSessions sessions,
+                     @Value("${devfield.interview.evaluation.enabled:false}") boolean evaluationEnabled) {
         this.db = db;
         this.tx = tx;
         this.sessions = sessions;
+        this.evaluationEnabled = evaluationEnabled;
     }
 
     Result submit(UUID owner, UUID session, UUID question, String answer, String submissionId) {
@@ -46,8 +51,20 @@ class InterviewAnswers {
                         SELECT max(position) FROM interview.question_turn WHERE session_id=?)
                     ON CONFLICT (session_id,question_id) DO NOTHING
                     """, submissionId, answer, session, question, session);
-            return inserted == 1 ? Result.ACCEPTED : Result.CONFLICT;
+            if (inserted == 0) return Result.CONFLICT;
+            enqueueEvaluationIfStopped(session, question);
+            return Result.ACCEPTED;
         });
+    }
+
+    void enqueueEvaluationIfStopped(UUID session, UUID question) {
+        if (!evaluationEnabled) return;
+        db.update("""
+                INSERT INTO interview.bundle_evaluation(session_id,closing_question_id)
+                SELECT session_id,question_id FROM interview.user_answer
+                WHERE session_id=? AND question_id=? AND state='STOPPED'
+                ON CONFLICT (session_id) DO NOTHING
+                """, session, question);
     }
 
     String lockSession(Target target) {

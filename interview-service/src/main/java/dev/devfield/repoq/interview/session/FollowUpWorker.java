@@ -121,6 +121,9 @@ class FollowUpWorker {
                     AND lease_until>clock_timestamp()
                 """, outcome.state(), "QUEUED".equals(outcome.state()) ? 2 << (claim.pending().attempt() - 1) : 0,
                 session, claim.job().question(), claim.pending().attempt());
+        if (updated == 1 && "STOPPED".equals(outcome.state())) {
+            answers.enqueueEvaluationIfStopped(session, claim.job().question());
+        }
         if (updated == 1 && "PUBLISHED".equals(outcome.state())) {
             db.update("""
                     INSERT INTO interview.question_turn(session_id,position,id,topic_key,evidence_id,question_text)

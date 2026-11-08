@@ -28,12 +28,15 @@ public class InterviewSessionController {
                          String topicKey, int completedBundles,
                          @JsonInclude(JsonInclude.Include.NON_NULL) InterviewSessions.CurrentQuestion currentQuestion,
                          @JsonInclude(JsonInclude.Include.NON_NULL) List<InterviewSessions.SavedAnswer> answers,
-                         @JsonInclude(JsonInclude.Include.NON_NULL) String answerProgress) {
+                         @JsonInclude(JsonInclude.Include.NON_NULL) String answerProgress,
+                         @JsonInclude(JsonInclude.Include.NON_NULL) String evaluationStatus,
+                         @JsonInclude(JsonInclude.Include.NON_NULL) InterviewSessions.Evaluation evaluation) {
         static Detail from(InterviewSessions.Session session, boolean followUpEnabled) {
             boolean showAnswers = followUpEnabled || !session.answers().isEmpty();
             return new Detail(session.id(), session.mode(), session.state(), session.snapshot().snapshotId(),
-                    session.topicKey(), 0, session.currentQuestion(), showAnswers ? session.answers() : null,
-                    showAnswers ? session.answerProgress() : null);
+                    session.topicKey(), "READY".equals(session.evaluationStatus()) ? 1 : 0,
+                    session.currentQuestion(), showAnswers ? session.answers() : null,
+                    showAnswers ? session.answerProgress() : null, session.evaluationStatus(), session.evaluation());
         }
     }
 

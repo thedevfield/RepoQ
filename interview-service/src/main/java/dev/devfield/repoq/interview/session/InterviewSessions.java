@@ -24,9 +24,13 @@ public class InterviewSessions {
 
     public record SavedAnswer(UUID questionId, String question, String answer) {}
 
+    public record Evaluation(UUID evidenceId, String strengths, String gaps, String improvements,
+                             String exampleAnswer, String keyPoints, String limitations) {}
+
     public record Session(UUID id, UUID ownerUserId, UUID projectId, ProjectSnapshot snapshot,
                           Mode mode, String state, String topicKey, long version, OffsetDateTime createdAt,
-                          CurrentQuestion currentQuestion, List<SavedAnswer> answers, String answerProgress) {}
+                          CurrentQuestion currentQuestion, List<SavedAnswer> answers, String answerProgress,
+                          String evaluationStatus, Evaluation evaluation) {}
 
     public static final class WriteBlocked extends RuntimeException {}
     public static final class DeletionConflict extends RuntimeException {}
@@ -79,7 +83,7 @@ public class InterviewSessions {
                         VALUES (?,?,?)
                         """, id, resolved.key(), UUID.fromString(resolved.primaryEvidenceId()));
             }
-            return new Session(id, owner, project, snapshot, mode, "PREPARING", topicKey, 1, created, null, List.of(), null);
+            return new Session(id, owner, project, snapshot, mode, "PREPARING", topicKey, 1, created, null, List.of(), null, null, null);
         });
     }
 
@@ -95,7 +99,9 @@ public class InterviewSessions {
                            WHEN latest.state='FAILED' THEN 'FOLLOW_UP_FAILED'
                            ELSE 'FOLLOW_UP_PENDING'
                        END,
-                       history.answers::text
+                       history.answers::text,
+                       CASE WHEN evaluation.state IN ('QUEUED','RUNNING') THEN 'PENDING' ELSE evaluation.state END,
+                       evaluation.result::text
                 FROM interview.interview_session s
                 LEFT JOIN LATERAL (
                     SELECT q.id,q.question_text,q.topic_key,a.state
@@ -110,6 +116,7 @@ public class InterviewSessions {
                         ON a.session_id=q.session_id AND a.question_id=q.id
                     WHERE q.session_id=s.id
                 ) history ON true
+                LEFT JOIN interview.bundle_evaluation evaluation ON evaluation.session_id=s.id
                 JOIN interview.interview_write_fence u ON u.scope='USER' AND u.owner_user_id=s.owner_user_id
                 JOIN interview.interview_write_fence p ON p.scope='PROJECT' AND p.project_id=s.project_id
                     AND p.owner_user_id=s.owner_user_id
@@ -118,7 +125,8 @@ public class InterviewSessions {
                 rs.getObject(3, UUID.class), decode(rs.getString(4)), Mode.valueOf(rs.getString(5)),
                 rs.getString(6), rs.getString(7), rs.getLong(8), rs.getObject(9, OffsetDateTime.class),
                 rs.getObject(10, UUID.class) == null ? null : new CurrentQuestion(rs.getObject(10, UUID.class),
-                        rs.getString(11), rs.getString(12)), decodeAnswers(rs.getString(14)), rs.getString(13)), sessionId, owner).stream().findFirst();
+                        rs.getString(11), rs.getString(12)), decodeAnswers(rs.getString(14)), rs.getString(13),
+                rs.getString(15), decodeEvaluation(rs.getString(16))), sessionId, owner).stream().findFirst();
     }
 
     public void deleteProject(UUID owner, UUID project, UUID job) {
@@ -198,6 +206,15 @@ public class InterviewSessions {
 
     private static void requireJob(Fence fence, UUID job) {
         if (!job.equals(fence.job())) throw new DeletionConflict();
+    }
+
+    private Evaluation decodeEvaluation(String value) {
+        if (value == null) return null;
+        try {
+            return json.readValue(value, Evaluation.class);
+        } catch (JsonProcessingException invalid) {
+            throw new IllegalStateException("Invalid stored bundle evaluation", invalid);
+        }
     }
 
     private List<SavedAnswer> decodeAnswers(String value) {
