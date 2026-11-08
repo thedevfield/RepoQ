@@ -9,6 +9,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
@@ -29,6 +30,8 @@ public class InterviewSessions {
     public record Evaluation(UUID evidenceId, String strengths, String gaps, String improvements,
                              String exampleAnswer, String keyPoints, String limitations) {}
 
+    public record MockSummary(String strengths, String gaps, String consistency, String studyAreas, String limitations) {}
+
     public record CompletedBundle(UUID bundleId, int sequence, String topicKey,
                                   List<SavedAnswer> answers, Evaluation evaluation) {}
 
@@ -36,7 +39,7 @@ public class InterviewSessions {
                           Mode mode, String state, String topicKey, long version, OffsetDateTime createdAt,
                           CurrentQuestion currentQuestion, List<SavedAnswer> answers, String answerProgress,
                           String evaluationStatus, Evaluation evaluation, UUID bundleId, int completedBundles,
-                          List<CompletedBundle> completedBundleHistory) {}
+                          List<CompletedBundle> completedBundleHistory, boolean managedMock, MockSummary mockSummary) {}
 
     public static final class WriteBlocked extends RuntimeException {}
     public static final class DeletionConflict extends RuntimeException {}
@@ -51,11 +54,14 @@ public class InterviewSessions {
     private final TransactionTemplate deletion;
     private final ObjectMapper json = new ObjectMapper();
     private final boolean generateFirstQuestion;
+    private final boolean mockEnabled;
 
     public InterviewSessions(JdbcTemplate db, PlatformTransactionManager manager,
-                             Optional<FirstQuestionGenerator> generator) {
+                             Optional<FirstQuestionGenerator> generator,
+                             @Value("${devfield.interview.mock.enabled:false}") boolean mockEnabled) {
         this.db = db;
         generateFirstQuestion = generator.isPresent();
+        this.mockEnabled = mockEnabled;
         writes = new TransactionTemplate(manager);
         deletion = new TransactionTemplate(manager);
         deletion.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
@@ -83,6 +89,10 @@ public class InterviewSessions {
                     INSERT INTO interview.question_bundle(id,session_id,sequence,requested_topic_key)
                     VALUES (?,?,1,?)
                     """, id, id, topicKey);
+            if (mode == Mode.MOCK && mockEnabled) {
+                db.update("INSERT INTO interview.mock_round(session_id) VALUES (?)", id);
+                db.update("INSERT INTO interview.mock_job(session_id,kind) VALUES (?,'PLAN')", id);
+            }
             if (generateFirstQuestion && mode == Mode.FREE && topicKey != null) {
                 var topics = snapshot.topics();
                 var resolved = "RANDOM".equals(topicKey)
@@ -90,7 +100,7 @@ public class InterviewSessions {
                         : topics.stream().filter(topic -> topic.key().equals(topicKey)).findFirst().orElseThrow();
                 enqueueMainQuestion(id, id, resolved);
             }
-            return new Session(id, owner, project, snapshot, mode, "PREPARING", topicKey, 1, created, null, List.of(), null, null, null, id, 0, List.of());
+            return new Session(id, owner, project, snapshot, mode, "PREPARING", topicKey, 1, created, null, List.of(), null, null, null, id, 0, List.of(), mode == Mode.MOCK && mockEnabled, null);
         });
     }
 
@@ -101,22 +111,27 @@ public class InterviewSessions {
                 """, session, bundle, topic.key(), UUID.fromString(topic.primaryEvidenceId()));
     }
 
-    List<HistoryItem> history(UUID owner, UUID project, OffsetDateTime before, UUID beforeId, int limit) {
+    List<HistoryItem> history(UUID owner, UUID project, OffsetDateTime before, UUID beforeId, int limit, boolean includeMock) {
         String boundary = before == null ? "" : "AND (s.created_at,s.id)<(?,?)";
-        Object[] args = before == null ? new Object[]{owner, project, limit}
-                : new Object[]{owner, project, before, beforeId, limit};
+        Object[] args = before == null ? new Object[]{owner, project, includeMock, limit}
+                : new Object[]{owner, project, includeMock, before, beforeId, limit};
         return db.query("""
                 SELECT page.id,page.mode,page.status,page.created_at,
-                    (SELECT count(*) FROM interview.bundle_evaluation e
-                     WHERE e.session_id=page.id AND e.state='READY') AS completed_bundles
+                    CASE WHEN page.mode='MOCK' THEN
+                        CASE WHEN page.phase IN ('EVALUATING','COMPLETED') THEN 5 ELSE page.current_sequence-1 END
+                    ELSE (SELECT count(*) FROM interview.bundle_evaluation e
+                          WHERE e.session_id=page.id AND e.state='READY') END AS completed_bundles
                 FROM (
-                    SELECT s.id,s.mode,s.created_at,CASE WHEN s.lifecycle='OPEN' THEN s.state ELSE s.lifecycle END AS status
+                    SELECT s.id,s.mode,s.created_at,s.state AS phase,m.current_sequence,
+                        CASE WHEN s.lifecycle='OPEN' THEN s.state ELSE s.lifecycle END AS status
                     FROM interview.interview_session s
+                    LEFT JOIN interview.mock_round m ON m.session_id=s.id
                     JOIN interview.interview_write_fence u ON u.scope='USER' AND u.owner_user_id=s.owner_user_id
                         AND u.state='ACTIVE'
                     JOIN interview.interview_write_fence p ON p.scope='PROJECT' AND p.project_id=s.project_id
                         AND p.owner_user_id=s.owner_user_id AND p.state='ACTIVE'
-                    WHERE s.owner_user_id=? AND s.project_id=? AND s.mode='FREE' %s
+                    WHERE s.owner_user_id=? AND s.project_id=?
+                        AND (s.mode='FREE' OR (? AND m.session_id IS NOT NULL)) %s
                     ORDER BY s.created_at DESC,s.id DESC LIMIT ?
                 ) page
                 ORDER BY page.created_at DESC,page.id DESC
@@ -144,10 +159,22 @@ public class InterviewSessions {
                            ELSE 'FOLLOW_UP_PENDING'
                        END,
                        history.answers::text,
-                       CASE WHEN evaluation.state IN ('QUEUED','RUNNING') THEN 'PENDING' ELSE evaluation.state END,
-                       evaluation.result::text, bundle.id,
-                       (SELECT count(*) FROM interview.bundle_evaluation e WHERE e.session_id=s.id AND e.state='READY'),
-                       CASE WHEN ? OR bundle.id<>s.id THEN (
+                       CASE WHEN m.session_id IS NULL THEN
+                           CASE WHEN evaluation.state IN ('QUEUED','RUNNING') THEN 'PENDING' ELSE evaluation.state END
+                       WHEN s.state='COMPLETED' THEN 'READY'
+                       WHEN s.state='EVALUATING' THEN CASE WHEN
+                           EXISTS (SELECT 1 FROM interview.bundle_evaluation e WHERE e.session_id=s.id AND e.state='FAILED')
+                           OR EXISTS (SELECT 1 FROM interview.mock_job j WHERE j.session_id=s.id
+                                      AND j.kind='SUMMARY' AND j.state='FAILED')
+                           THEN 'FAILED' ELSE 'PENDING' END
+                       END,
+                       CASE WHEN m.session_id IS NULL THEN evaluation.result::text END, bundle.id,
+                       CASE WHEN m.session_id IS NOT NULL THEN
+                           CASE WHEN s.state IN ('EVALUATING','COMPLETED') THEN 5 ELSE m.current_sequence-1 END
+                       ELSE (SELECT count(*) FROM interview.bundle_evaluation e WHERE e.session_id=s.id AND e.state='READY')
+                       END,
+                       CASE WHEN (s.mode='FREE' AND (? OR bundle.id<>s.id))
+                           OR (s.mode='MOCK' AND s.state='COMPLETED' AND m.summary IS NOT NULL) THEN (
                            SELECT COALESCE(jsonb_agg(jsonb_build_object('bundleId',b.id,'sequence',b.sequence,
                                'topicKey',main.resolved_topic_key,'answers',saved.answers,
                                'evaluation',e.result) ORDER BY b.sequence),'[]'::jsonb)
@@ -162,11 +189,14 @@ public class InterviewSessions {
                                WHERE q.bundle_id=b.id
                            ) saved ON true
                            WHERE b.session_id=s.id
-                       ) ELSE '[]'::jsonb END::text
+                       ) ELSE '[]'::jsonb END::text, m.session_id IS NOT NULL,
+                       CASE WHEN s.state='COMPLETED' THEN m.summary::text END
                 FROM interview.interview_session s
+                LEFT JOIN interview.mock_round m ON m.session_id=s.id
                 JOIN LATERAL (
                     SELECT id,requested_topic_key FROM interview.question_bundle
-                    WHERE session_id=s.id ORDER BY sequence DESC LIMIT 1
+                    WHERE session_id=s.id AND (m.session_id IS NULL OR sequence=m.current_sequence)
+                    ORDER BY sequence DESC LIMIT 1
                 ) bundle ON true
                 LEFT JOIN LATERAL (
                     SELECT q.id,q.question_text,q.topic_key,a.state
@@ -191,8 +221,9 @@ public class InterviewSessions {
                 rs.getString(6), rs.getString(7), rs.getLong(8), rs.getObject(9, OffsetDateTime.class),
                 rs.getObject(10, UUID.class) == null ? null : new CurrentQuestion(rs.getObject(10, UUID.class),
                         rs.getString(11), rs.getString(12)), decodeList(rs.getString(14), SavedAnswer.class), rs.getString(13),
-                rs.getString(15), decodeEvaluation(rs.getString(16)), rs.getObject(17, UUID.class),
-                rs.getInt(18), decodeList(rs.getString(19), CompletedBundle.class)), includeHistory, sessionId, owner)
+                rs.getString(15), decodeResult(rs.getString(16), Evaluation.class), rs.getObject(17, UUID.class),
+                rs.getInt(18), decodeList(rs.getString(19), CompletedBundle.class), rs.getBoolean(20),
+                decodeResult(rs.getString(21), MockSummary.class)), includeHistory, sessionId, owner)
                 .stream().findFirst();
     }
 
@@ -275,10 +306,10 @@ public class InterviewSessions {
         if (!job.equals(fence.job())) throw new DeletionConflict();
     }
 
-    private Evaluation decodeEvaluation(String value) {
+    private <T> T decodeResult(String value, Class<T> type) {
         if (value == null) return null;
         try {
-            return json.readValue(value, Evaluation.class);
+            return json.readValue(value, type);
         } catch (JsonProcessingException invalid) {
             throw new IllegalStateException("Invalid stored bundle evaluation", invalid);
         }

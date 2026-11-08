@@ -29,6 +29,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -78,6 +79,10 @@ class OllamaScheduledInterviewIntegrationTest {
 
     private static final AtomicReference<Reply> FOLLOW_UP_REPLY = new AtomicReference<>();
     private static final AtomicReference<JsonNode> FOLLOW_UP_REQUEST = new AtomicReference<>();
+    private static final AtomicReference<Reply> MOCK_SUMMARY_REPLY = new AtomicReference<>();
+    private static final AtomicReference<JsonNode> MOCK_SUMMARY_REQUEST = new AtomicReference<>();
+    private static final AtomicReference<Reply> MOCK_PLAN_REPLY = new AtomicReference<>();
+    private static final AtomicReference<JsonNode> MOCK_PLAN_REQUEST = new AtomicReference<>();
     private static final AtomicReference<Reply> MAIN_REPLY = new AtomicReference<>();
     private static final AtomicReference<Reply> EVALUATION_REPLY = new AtomicReference<>();
     private static final AtomicReference<JsonNode> EVALUATION_REQUEST = new AtomicReference<>();
@@ -133,7 +138,13 @@ class OllamaScheduledInterviewIntegrationTest {
                 JsonNode request = JSON.readTree(exchange.getRequestBody());
                 String content = OllamaFirstQuestionGeneratorTest.content(EVIDENCE);
                 Reply reply = null;
-                if (request.at("/format/properties/exampleAnswer").isObject()) {
+                if (request.at("/format/properties/studyAreas").isObject()) {
+                    MOCK_SUMMARY_REQUEST.set(request);
+                    reply = MOCK_SUMMARY_REPLY.get();
+                } else if (request.at("/format/properties/questions").isObject()) {
+                    MOCK_PLAN_REQUEST.set(request);
+                    reply = MOCK_PLAN_REPLY.get();
+                } else if (request.at("/format/properties/exampleAnswer").isObject()) {
                     EVALUATION_REQUEST.set(request);
                     reply = EVALUATION_REPLY.get();
                 } else if (request.at("/format/properties/action").isObject()) {
@@ -181,6 +192,10 @@ class OllamaScheduledInterviewIntegrationTest {
         FOLLOW_UP_REPLY.set(null);
         FOLLOW_UP_REQUEST.set(null);
         SNAPSHOT_CALLS.set(0);
+        MOCK_SUMMARY_REPLY.set(null);
+        MOCK_SUMMARY_REQUEST.set(null);
+        MOCK_PLAN_REPLY.set(null);
+        MOCK_PLAN_REQUEST.set(null);
         MAIN_REPLY.set(null);
         EVALUATION_REPLY.set(null);
         EVALUATION_REQUEST.set(null);
@@ -452,12 +467,63 @@ class OllamaScheduledInterviewIntegrationTest {
             "devfield.interview.follow-up.poll-ms=100",
             "devfield.interview.evaluation.enabled=true",
             "devfield.interview.evaluation.poll-ms=100",
-            "devfield.interview.next-bundle.enabled=true"
+            "devfield.interview.next-bundle.enabled=true",
+            "devfield.interview.mock.enabled=true",
+            "devfield.interview.mock.poll-ms=100",
+            "devfield.interview.lifecycle.enabled=true",
+            "devfield.interview.session-deletion.enabled=true"
     })
     @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
     class ScheduledFollowUp {
         @LocalServerPort int scheduledPort;
         @MockitoBean JwtDecoder scheduledDecoder;
+
+        @Test
+        void scheduledMockWorkersPublishOnlyAfterAllEvaluationsAreReady() throws Exception {
+            port = scheduledPort;
+            when(scheduledDecoder.decode(TOKEN)).thenReturn(Jwt.withTokenValue(TOKEN).header("alg", "RS256")
+                    .subject(OWNER.toString()).issuedAt(Instant.now().minusSeconds(1))
+                    .expiresAt(Instant.now().plusSeconds(120)).build());
+            var entered = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            MOCK_PLAN_REPLY.set(new Reply(200, plan(5, false)));
+            FOLLOW_UP_REPLY.set(new Reply(200, outcome("STOP", "", EVIDENCE)));
+            EVALUATION_REPLY.set(new Reply(200, evaluation(EVIDENCE, "Bundle feedback.")));
+            MOCK_SUMMARY_REPLY.set(new Reply(200, summary(), entered, release));
+            try (var http = HttpClient.newHttpClient()) {
+                UUID id = startMock(http);
+                for (int sequence = 1; sequence <= 5; sequence++) {
+                    String text = "Distinct question " + sequence + "?";
+                    long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+                    var current = detail(http, id);
+                    while (!text.equals(current.at("/currentQuestion/text").asText()) && System.nanoTime() < deadline) {
+                        Thread.sleep(50);
+                        current = detail(http, id);
+                    }
+                    assertEquals(text, current.at("/currentQuestion/text").asText(), current.toString());
+                    assertEquals(sequence - 1, current.path("completedBundles").asInt());
+                    assertFalse(current.has("completedBundleHistory"));
+                    assertFalse(current.has("sessionEvaluation"));
+                    assertEquals(202, submit(http, id, current.at("/currentQuestion/id").asText(),
+                            "scheduled answer " + sequence, "scheduled-mock-" + sequence));
+                }
+                try {
+                    assertTrue(entered.await(10, TimeUnit.SECONDS));
+                    assertHiddenEvaluations(detail(http, id));
+                    assertEquals(5, db.queryForObject("""
+                            SELECT count(*) FROM interview.bundle_evaluation WHERE session_id=? AND state='READY'
+                            """, Integer.class, id));
+                } finally {
+                    release.countDown();
+                }
+                var completed = awaitEvaluation(http, id, "READY");
+                assertEquals("COMPLETED", completed.path("status").asText());
+                assertEquals(5, completed.path("completedBundleHistory").size());
+                assertEquals("Summary strengths.", completed.at("/sessionEvaluation/strengths").asText());
+            } finally {
+                release.countDown();
+            }
+        }
 
         @Test
         void nextBundleReusesPinnedSnapshotAndPublishesSecondEvaluation() throws Exception {
@@ -1238,6 +1304,374 @@ class OllamaScheduledInterviewIntegrationTest {
     }
 
     private record GenerationWork(UUID session, Runnable poll, AtomicReference<Reply> reply, GenerationStage stage) {}
+
+    @Nested
+    @TestPropertySource(properties = {
+            "devfield.interview.mock.enabled=true",
+            "devfield.interview.mock.poll-ms=3600000",
+            "devfield.interview.evaluation.enabled=true",
+            "devfield.interview.evaluation.poll-ms=3600000",
+            "devfield.interview.history.enabled=true",
+            "devfield.interview.lifecycle.enabled=true",
+            "devfield.interview.next-bundle.enabled=true",
+            "devfield.interview.session-deletion.enabled=true"
+    })
+    @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
+    class MockRounds {
+        @LocalServerPort int mockPort;
+        @MockitoBean JwtDecoder mockDecoder;
+        @Autowired MockRoundWorker planner;
+        @Autowired FollowUpWorker mockFollowUp;
+        @Autowired BundleEvaluationWorker mockEvaluator;
+
+        @BeforeEach
+        void authenticateMock() {
+            port = mockPort;
+            when(mockDecoder.decode(TOKEN)).thenReturn(Jwt.withTokenValue(TOKEN).header("alg", "RS256")
+                    .subject(OWNER.toString()).issuedAt(Instant.now().minusSeconds(1))
+                    .expiresAt(Instant.now().plusSeconds(120)).build());
+        }
+
+        @Test
+        void plansFiveQuestionsFromOnlyThePinnedSnapshotAndOpensTheFirst() throws Exception {
+            try (var http = HttpClient.newHttpClient()) {
+                UUID id = startMock(http);
+                MOCK_PLAN_REPLY.set(new Reply(200, plan(5, false)));
+                planner.poll();
+                var detail = detail(http, id);
+                assertEquals("ACTIVE", detail.path("status").asText());
+                assertEquals(SNAPSHOT_ID, detail.path("snapshotId").asText());
+                assertEquals("Distinct question 1?", detail.at("/currentQuestion/text").asText());
+                assertFalse(detail.toString().contains("Distinct question 2?"));
+                assertEquals(5, mockCount(id, "question_turn"));
+                var input = JSON.readTree(MOCK_PLAN_REQUEST.get().at("/messages/1/content").asText());
+                assertEquals(JSON.valueToTree(Map.of("facts", List.of(
+                        Map.of("topicKey", "JAVA", "evidenceId", EVIDENCE, "codeFact", SUMMARY)))), input);
+                assertEquals(1, SNAPSHOT_CALLS.get());
+            }
+        }
+
+        @Test
+        void answersAdvanceFiveBundlesWithoutI05AndPreservePositionOnPause() throws Exception {
+            try (var http = HttpClient.newHttpClient()) {
+                UUID id = startMock(http);
+                MOCK_PLAN_REPLY.set(new Reply(200, plan(5, false)));
+                planner.poll();
+                String main = detail(http, id).at("/currentQuestion/id").asText();
+                assertEquals(409, lifecycle(http, id, "END").statusCode());
+                assertLifecycle(http, id, "PAUSE", "PAUSED");
+                assertEquals(409, submit(http, id, main, "paused", "paused"));
+                assertEquals(main, detail(http, id).at("/currentQuestion/id").asText());
+                assertLifecycle(http, id, "RESUME", "ACTIVE");
+                assertEquals(404, next(http, id, id.toString(), "JAVA").statusCode());
+
+                for (int position = 0; position < 4; position++) {
+                    String current = detail(http, id).at("/currentQuestion/id").asText();
+                    assertEquals(202, submit(http, id, current, "answer " + position, "first-" + position));
+                    if (position < 3) {
+                        FOLLOW_UP_REPLY.set(new Reply(200, outcome("FOLLOW_UP", "Follow-up " + position + "?", EVIDENCE)));
+                        mockFollowUp.poll();
+                        assertEquals("Follow-up " + position + "?", detail(http, id).at("/currentQuestion/text").asText());
+                    }
+                }
+                assertEquals(202, submit(http, id, main, "answer 0", "first-0"));
+                assertEquals(409, submit(http, id, main, "different", "new-key"));
+
+                FOLLOW_UP_REPLY.set(new Reply(200, outcome("STOP", "", EVIDENCE)));
+                for (int sequence = 2; sequence <= 5; sequence++) {
+                    var current = detail(http, id);
+                    assertEquals(sequence - 1, current.path("completedBundles").asInt());
+                    assertEquals("Distinct question " + sequence + "?", current.at("/currentQuestion/text").asText());
+                    assertFalse(current.has("evaluation"));
+                    assertEquals(202, submit(http, id, current.at("/currentQuestion/id").asText(),
+                            "response " + sequence, "bundle-" + sequence));
+                    mockFollowUp.poll();
+                    var data = JSON.readTree(FOLLOW_UP_REQUEST.get().at("/messages/1/content").asText());
+                    assertEquals(1, data.path("turns").size());
+                    assertEquals("response " + sequence, data.at("/turns/0/answer").asText());
+                }
+                var finished = detail(http, id);
+                assertEquals("EVALUATING", finished.path("status").asText());
+                assertEquals(5, finished.path("completedBundles").asInt());
+                assertFalse(finished.has("evaluation"));
+                assertFalse(finished.has("currentQuestion"));
+                assertEquals(8, mockCount(id, "user_answer"));
+            }
+        }
+
+        @ParameterizedTest @ValueSource(booleans = {false, true})
+        void invalidPlanNeverPublishesPartialQuestions(boolean duplicate) throws Exception {
+            try (var http = HttpClient.newHttpClient()) {
+                UUID id = startMock(http);
+                MOCK_PLAN_REPLY.set(new Reply(200, plan(duplicate ? 5 : 4, duplicate)));
+                planner.poll();
+                assertEquals("GENERATION_FAILED", detail(http, id).path("status").asText());
+                assertEquals(0, mockCount(id, "question_turn"));
+            }
+        }
+
+        @ParameterizedTest @ValueSource(strings = {"I-07", "X-02", "X-04"})
+        void deletingWhilePlannerWaitsPreventsLatePublication(String route) throws Exception {
+            try (var http = HttpClient.newHttpClient(); var executor = Executors.newSingleThreadExecutor()) {
+                UUID id = startMock(http);
+                var entered = new CountDownLatch(1);
+                var release = new CountDownLatch(1);
+                MOCK_PLAN_REPLY.set(new Reply(200, plan(5, false), entered, release));
+                var running = executor.submit(planner::poll);
+                try {
+                    assertTrue(entered.await(5, TimeUnit.SECONDS));
+                    if ("I-07".equals(route)) {
+                        assertEquals(409, deleteSession(http, id).statusCode());
+                        assertEquals(204, http.send(request("/api/interviews/" + id + "?confirmAbandon=true")
+                                .DELETE().build(), HttpResponse.BodyHandlers.discarding()).statusCode());
+                    } else {
+                        assertEquals(204, delete(http, "X-04".equals(route), UUID.randomUUID()));
+                    }
+                } finally {
+                    release.countDown();
+                }
+                running.get(10, TimeUnit.SECONDS);
+                assertEquals(0, mockCount(id, "mock_round"));
+                assertEquals(0, mockCount(id, "mock_job"));
+                assertEquals(0, mockCount(id, "question_turn"));
+            }
+        }
+
+        @Test
+        void publishesFiveEvaluationsAndSummaryTogetherAfterRetry() throws Exception {
+            try (var http = HttpClient.newHttpClient()) {
+                UUID id = answerAll(http);
+                assertHiddenEvaluations(detail(http, id));
+                assertEquals(5, mockCount(id, "bundle_evaluation"));
+                planner.pollSummary();
+                assertNull(MOCK_SUMMARY_REQUEST.get());
+
+                for (int i = 0; i < 5; i++) {
+                    EVALUATION_REPLY.set(new Reply(200, evaluation(EVIDENCE, "Bundle feedback.")));
+                    mockEvaluator.poll();
+                    assertHiddenEvaluations(detail(http, id));
+                }
+                assertEquals(5, db.queryForObject("""
+                        SELECT count(*) FROM interview.bundle_evaluation WHERE session_id=? AND state='READY'
+                        """, Integer.class, id));
+                MOCK_SUMMARY_REPLY.set(new Reply(503, null));
+                planner.pollSummary();
+                assertHiddenEvaluations(detail(http, id));
+                assertEquals(5, mockCount(id, "user_answer"));
+                db.update("UPDATE interview.mock_job SET due_at=clock_timestamp() WHERE session_id=? AND kind='SUMMARY'", id);
+
+                MOCK_SUMMARY_REPLY.set(new Reply(200, "{}"));
+                planner.pollSummary();
+                var failed = detail(http, id);
+                assertHiddenEvaluations(failed);
+                assertEquals("FAILED", failed.path("evaluationStatus").asText());
+                assertLifecycle(http, id, "RESUME", "EVALUATING");
+                assertEquals("PENDING", detail(http, id).path("evaluationStatus").asText());
+                assertEquals(5, db.queryForObject("""
+                        SELECT count(*) FROM interview.bundle_evaluation WHERE session_id=? AND state='READY'
+                        """, Integer.class, id));
+
+                MOCK_SUMMARY_REPLY.set(new Reply(200, summary()));
+                planner.pollSummary();
+                var completed = detail(http, id);
+                assertEquals("COMPLETED", completed.path("status").asText());
+                assertEquals("READY", completed.path("evaluationStatus").asText());
+                assertEquals("Summary strengths.", completed.at("/sessionEvaluation/strengths").asText());
+                assertEquals(5, completed.path("completedBundleHistory").size());
+                for (int i = 0; i < 5; i++) {
+                    assertEquals(i + 1, completed.at("/completedBundleHistory/" + i + "/sequence").asInt());
+                    assertEquals("answer " + (i + 1),
+                            completed.at("/completedBundleHistory/" + i + "/answers/0/answer").asText());
+                    assertEquals("Bundle feedback.",
+                            completed.at("/completedBundleHistory/" + i + "/evaluation/strengths").asText());
+                }
+                var input = JSON.readTree(MOCK_SUMMARY_REQUEST.get().at("/messages/1/content").asText());
+                assertEquals(5, input.path("bundles").size());
+                var history = http.send(request("/api/interviews?projectId=" + PROJECT).GET().build(),
+                        HttpResponse.BodyHandlers.ofString());
+                assertEquals(200, history.statusCode(), history.body());
+                var item = JSON.readTree(history.body()).at("/items/0");
+                assertEquals(id.toString(), item.path("interviewId").asText());
+                assertEquals("MOCK", item.path("mode").asText());
+                assertEquals("COMPLETED", item.path("status").asText());
+                assertFalse(item.has("sessionEvaluation"));
+                assertEquals(204, deleteSession(http, id).statusCode());
+            }
+        }
+
+        @Test
+        void resumesFailedFollowUpWithoutLosingTheAnswerOrPublishingTheOldAttempt() throws Exception {
+            try (var http = HttpClient.newHttpClient(); var executor = Executors.newFixedThreadPool(2)) {
+                UUID id = startMock(http);
+                MOCK_PLAN_REPLY.set(new Reply(200, plan(5, false)));
+                planner.poll();
+                String question = detail(http, id).at("/currentQuestion/id").asText();
+                assertEquals(202, submit(http, id, question, "Saved original answer.", "mock-resume"));
+
+                var firstEntered = new CountDownLatch(1);
+                var firstRelease = new CountDownLatch(1);
+                var retryEntered = new CountDownLatch(1);
+                var retryRelease = new CountDownLatch(1);
+                FOLLOW_UP_REPLY.set(new Reply(200, outcome("FOLLOW_UP", "Stale question?", EVIDENCE),
+                        firstEntered, firstRelease));
+                var first = executor.submit(mockFollowUp::poll);
+                try {
+                    assertTrue(firstEntered.await(5, TimeUnit.SECONDS));
+                    db.update("""
+                            UPDATE interview.user_answer SET lease_until=clock_timestamp(),due_at=clock_timestamp()
+                            WHERE session_id=?
+                            """, id);
+                    FOLLOW_UP_REPLY.set(new Reply(200, "{}"));
+                    mockFollowUp.poll();
+                    assertEquals("FOLLOW_UP_FAILED", detail(http, id).path("answerProgress").asText());
+                    assertLifecycle(http, id, "RESUME", "ACTIVE");
+                    assertEquals("FOLLOW_UP_PENDING", detail(http, id).path("answerProgress").asText());
+                    assertEquals(202, submit(http, id, question, "Saved original answer.", "mock-resume"));
+                    assertEquals(409, submit(http, id, question, "Changed answer.", "mock-resume"));
+
+                    FOLLOW_UP_REPLY.set(new Reply(200, outcome("STOP", "", EVIDENCE), retryEntered, retryRelease));
+                    var retry = executor.submit(mockFollowUp::poll);
+                    assertTrue(retryEntered.await(5, TimeUnit.SECONDS));
+                    firstRelease.countDown();
+                    first.get(10, TimeUnit.SECONDS);
+                    var pending = detail(http, id);
+                    assertEquals("FOLLOW_UP_PENDING", pending.path("answerProgress").asText());
+                    assertFalse(pending.has("currentQuestion"));
+                    assertEquals("Saved original answer.", pending.at("/answers/0/answer").asText());
+                    assertEquals(Map.of("answer_text", "Saved original answer.", "submission_id", "mock-resume",
+                                    "attempt", 1, "state", "RUNNING"),
+                            db.queryForMap("""
+                                    SELECT answer_text,submission_id,attempt,state FROM interview.user_answer WHERE session_id=?
+                                    """, id));
+                    retryRelease.countDown();
+                    retry.get(10, TimeUnit.SECONDS);
+                    assertEquals("Distinct question 2?", detail(http, id).at("/currentQuestion/text").asText());
+                    assertEquals(1, detail(http, id).path("completedBundles").asInt());
+                    assertEquals(5, mockCount(id, "question_turn"));
+                } finally {
+                    firstRelease.countDown();
+                    retryRelease.countDown();
+                }
+            }
+        }
+
+        @Test
+        void manualRetryRejectsAnOlderSummaryWithTheSameAttemptNumber() throws Exception {
+            try (var http = HttpClient.newHttpClient(); var executor = Executors.newFixedThreadPool(2)) {
+                UUID id = answerAll(http);
+                EVALUATION_REPLY.set(new Reply(200, evaluation(EVIDENCE, "Bundle feedback.")));
+                for (int i = 0; i < 5; i++) mockEvaluator.poll();
+                var firstEntered = new CountDownLatch(1);
+                var firstRelease = new CountDownLatch(1);
+                var retryEntered = new CountDownLatch(1);
+                var retryRelease = new CountDownLatch(1);
+                MOCK_SUMMARY_REPLY.set(new Reply(200, summary(), firstEntered, firstRelease));
+                var first = executor.submit(planner::pollSummary);
+                try {
+                    assertTrue(firstEntered.await(5, TimeUnit.SECONDS));
+                    db.update("""
+                            UPDATE interview.mock_job SET attempt=3,lease_until=clock_timestamp(),due_at=clock_timestamp()
+                            WHERE session_id=? AND kind='SUMMARY'
+                            """, id);
+                    planner.pollSummary();
+                    assertEquals("FAILED", detail(http, id).path("evaluationStatus").asText());
+                    assertLifecycle(http, id, "RESUME", "EVALUATING");
+
+                    MOCK_SUMMARY_REPLY.set(new Reply(200, summary(), retryEntered, retryRelease));
+                    var retry = executor.submit(planner::pollSummary);
+                    assertTrue(retryEntered.await(5, TimeUnit.SECONDS));
+                    firstRelease.countDown();
+                    first.get(10, TimeUnit.SECONDS);
+                    assertHiddenEvaluations(detail(http, id));
+                    retryRelease.countDown();
+                    retry.get(10, TimeUnit.SECONDS);
+                    assertEquals("COMPLETED", detail(http, id).path("status").asText());
+                } finally {
+                    firstRelease.countDown();
+                    retryRelease.countDown();
+                }
+            }
+        }
+
+        @ParameterizedTest @ValueSource(strings = {"I-07", "X-02", "X-04"})
+        void deletingWhileSummaryWaitsDiscardsAllEvaluations(String route) throws Exception {
+            try (var http = HttpClient.newHttpClient(); var executor = Executors.newSingleThreadExecutor()) {
+                UUID id = answerAll(http);
+                EVALUATION_REPLY.set(new Reply(200, evaluation(EVIDENCE, "Bundle feedback.")));
+                for (int i = 0; i < 5; i++) mockEvaluator.poll();
+                assertHiddenEvaluations(detail(http, id));
+
+                var entered = new CountDownLatch(1);
+                var release = new CountDownLatch(1);
+                MOCK_SUMMARY_REPLY.set(new Reply(200, summary(), entered, release));
+                var running = executor.submit(planner::pollSummary);
+                try {
+                    assertTrue(entered.await(5, TimeUnit.SECONDS));
+                    if ("I-07".equals(route)) {
+                        assertEquals(204, http.send(request("/api/interviews/" + id + "?confirmAbandon=true")
+                                .DELETE().build(), HttpResponse.BodyHandlers.discarding()).statusCode());
+                    } else {
+                        assertEquals(204, delete(http, "X-04".equals(route), UUID.randomUUID()));
+                    }
+                } finally {
+                    release.countDown();
+                }
+                running.get(10, TimeUnit.SECONDS);
+                assertEquals(0, mockCount(id, "mock_round"));
+                assertEquals(0, mockCount(id, "bundle_evaluation"));
+                assertEquals(0, mockCount(id, "mock_job"));
+            }
+        }
+
+        private UUID answerAll(HttpClient http) throws Exception {
+            UUID id = startMock(http);
+            MOCK_PLAN_REPLY.set(new Reply(200, plan(5, false)));
+            planner.poll();
+            FOLLOW_UP_REPLY.set(new Reply(200, outcome("STOP", "", EVIDENCE)));
+            for (int sequence = 1; sequence <= 5; sequence++) {
+                var current = detail(http, id);
+                assertEquals(0, mockCount(id, "bundle_evaluation"));
+                assertEquals(202, submit(http, id, current.at("/currentQuestion/id").asText(),
+                        "answer " + sequence, "mock-" + sequence));
+                mockFollowUp.poll();
+            }
+            return id;
+        }
+
+        private int mockCount(UUID id, String table) {
+            return db.queryForObject("SELECT count(*) FROM interview." + table + " WHERE session_id=?", Integer.class, id);
+        }
+    }
+
+    private void assertHiddenEvaluations(JsonNode detail) {
+        assertEquals("EVALUATING", detail.path("status").asText());
+        assertFalse(detail.has("evaluation"));
+        assertFalse(detail.has("completedBundleHistory"));
+        assertFalse(detail.has("sessionEvaluation"));
+    }
+
+    private String summary() {
+        return JSON.valueToTree(Map.of("strengths", "Summary strengths.", "gaps", "Improve depth.",
+                "consistency", "Consistent.", "studyAreas", "Trade-offs.", "limitations", "This exam only.")).toString();
+    }
+
+    private UUID startMock(HttpClient http) throws Exception {
+        var response = http.send(request("/api/interviews").header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(Map.of(
+                        "projectId", PROJECT, "mode", "MOCK")))).build(), HttpResponse.BodyHandlers.ofString());
+        assertEquals(201, response.statusCode(), response.body());
+        var detail = JSON.readTree(response.body());
+        assertEquals("PREPARING", detail.path("status").asText());
+        assertFalse(detail.has("currentQuestion"));
+        return UUID.fromString(detail.path("interviewId").asText());
+    }
+
+    private String plan(int count, boolean duplicate) {
+        var questions = java.util.stream.IntStream.rangeClosed(1, count)
+                .mapToObj(i -> Map.of("topicKey", "JAVA", "evidenceId", EVIDENCE,
+                        "question", "Distinct question " + (duplicate ? 1 : i) + "?")).toList();
+        return JSON.valueToTree(Map.of("questions", questions)).toString();
+    }
 
     private int evaluationCount(UUID id) {
         return db.queryForObject("SELECT count(*) FROM interview.bundle_evaluation WHERE session_id=?", Integer.class, id);

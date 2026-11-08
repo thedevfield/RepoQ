@@ -64,15 +64,18 @@ public class InterviewSessionController {
                          @JsonInclude(JsonInclude.Include.NON_NULL) String evaluationStatus,
                          @JsonInclude(JsonInclude.Include.NON_NULL) InterviewSessions.Evaluation evaluation,
                          @JsonInclude(JsonInclude.Include.NON_NULL) UUID currentBundleId,
-                         @JsonInclude(JsonInclude.Include.NON_NULL) List<InterviewSessions.CompletedBundle> completedBundleHistory) {
+                         @JsonInclude(JsonInclude.Include.NON_NULL) List<InterviewSessions.CompletedBundle> completedBundleHistory,
+                         @JsonInclude(JsonInclude.Include.NON_NULL) InterviewSessions.MockSummary sessionEvaluation) {
         static Detail from(InterviewSessions.Session session, boolean followUpEnabled, boolean showBundles) {
             boolean showAnswers = followUpEnabled || !session.answers().isEmpty();
-            showBundles = showBundles || !session.bundleId().equals(session.id());
+            showBundles = showBundles || !session.bundleId().equals(session.id()) || session.managedMock();
             return new Detail(session.id(), session.mode(), session.state(), session.snapshot().snapshotId(),
                     session.topicKey(), session.completedBundles(),
                     session.currentQuestion(), showAnswers ? session.answers() : null,
                     showAnswers ? session.answerProgress() : null, session.evaluationStatus(), session.evaluation(),
-                    showBundles ? session.bundleId() : null, showBundles ? session.completedBundleHistory() : null);
+                    showBundles ? session.bundleId() : null,
+                    showBundles && (!session.managedMock() || session.mockSummary() != null)
+                            ? session.completedBundleHistory() : null, session.mockSummary());
         }
     }
 
@@ -87,6 +90,8 @@ public class InterviewSessionController {
     private final boolean lifecycleEnabled;
     private final boolean sessionDeletionEnabled;
     private final boolean historyEnabled;
+    private final boolean mockEnabled;
+    private final boolean evaluationEnabled;
 
     public InterviewSessionController(InterviewAuthentication auth, ProjectSnapshotClient snapshots,
                                       InterviewSessions sessions, InterviewAnswers answers, InterviewBundles bundles, InterviewLifecycle lifecycle,
@@ -94,7 +99,9 @@ public class InterviewSessionController {
                                       @Value("${devfield.interview.next-bundle.enabled:false}") boolean nextBundleEnabled,
                                       @Value("${devfield.interview.lifecycle.enabled:false}") boolean lifecycleEnabled,
                                       @Value("${devfield.interview.session-deletion.enabled:false}") boolean sessionDeletionEnabled,
-                                      @Value("${devfield.interview.history.enabled:false}") boolean historyEnabled) {
+                                      @Value("${devfield.interview.history.enabled:false}") boolean historyEnabled,
+                                      @Value("${devfield.interview.mock.enabled:false}") boolean mockEnabled,
+                                      @Value("${devfield.interview.evaluation.enabled:false}") boolean evaluationEnabled) {
         this.auth = auth;
         this.snapshots = snapshots;
         this.sessions = sessions;
@@ -106,18 +113,26 @@ public class InterviewSessionController {
         this.lifecycleEnabled = lifecycleEnabled;
         this.sessionDeletionEnabled = sessionDeletionEnabled;
         this.historyEnabled = historyEnabled;
+        this.mockEnabled = mockEnabled;
+        this.evaluationEnabled = evaluationEnabled;
     }
 
     @PostMapping("/api/interviews")
     public ResponseEntity<?> create(@AuthenticationPrincipal Jwt jwt, @RequestBody Start request) {
         if (request.projectId() == null || request.mode() == null) return error(400, "invalid_request");
-        if (request.mode() != InterviewSessions.Mode.FREE) return error(400, "interview_mode_not_supported");
+        boolean mock = request.mode() == InterviewSessions.Mode.MOCK;
+        if (mock && !mockEnabled) return error(400, "interview_mode_not_supported");
+        if (mock && (!followUpEnabled || !lifecycleEnabled || !sessionDeletionEnabled || !evaluationEnabled)) {
+            return error(503, "interview_unavailable");
+        }
         String topic = request.topicKey();
-        if (topic == null || !topic.matches("[A-Z][A-Z0-9_]{0,63}")) return error(400, "invalid_topic");
+        if (mock ? topic != null : topic == null || !topic.matches("[A-Z][A-Z0-9_]{0,63}")) {
+            return error(400, "invalid_topic");
+        }
 
         // X-01 verifies AUTH-15 and runs before taking any Interview database locks.
         var snapshot = snapshots.fetch(request.projectId(), "Bearer " + jwt.getTokenValue());
-        if (!"RANDOM".equals(topic) && snapshot.topics().stream().noneMatch(candidate -> topic.equals(candidate.key())))
+        if (!mock && !"RANDOM".equals(topic) && snapshot.topics().stream().noneMatch(candidate -> topic.equals(candidate.key())))
             return error(400, "invalid_topic");
 
         var session = sessions.create(UUID.fromString(jwt.getSubject()), request.projectId(), request.mode(), snapshot, topic);
@@ -140,7 +155,8 @@ public class InterviewSessionController {
             return error(400, "invalid_cursor");
         }
         var rows = sessions.history(UUID.fromString(jwt.getSubject()), projectId,
-                boundary == null ? null : boundary.createdAt(), boundary == null ? null : boundary.id(), limit + 1);
+                boundary == null ? null : boundary.createdAt(), boundary == null ? null : boundary.id(), limit + 1,
+                mockEnabled);
         var items = rows.subList(0, Math.min(limit, rows.size()));
         String next = rows.size() > limit ? HistoryCursor.encode(projectId, items.getLast()) : null;
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new HistoryPage(items, next));
@@ -150,7 +166,7 @@ public class InterviewSessionController {
     public ResponseEntity<?> find(@AuthenticationPrincipal Jwt jwt, @PathVariable UUID id) {
         auth.verify("Bearer " + jwt.getTokenValue());
         var session = sessions.find(UUID.fromString(jwt.getSubject()), id, nextBundleEnabled)
-                .filter(found -> found.mode() == InterviewSessions.Mode.FREE);
+                .filter(found -> found.mode() == InterviewSessions.Mode.FREE || mockEnabled && found.managedMock());
         if (session.isEmpty()) return error(404, "interview_not_found");
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(Detail.from(session.get(), followUpEnabled, nextBundleEnabled));
     }
@@ -165,7 +181,7 @@ public class InterviewSessionController {
             return error(400, "invalid_request");
         }
         return switch (answers.submit(UUID.fromString(jwt.getSubject()), id, body.questionId(), body.answer(),
-                body.submissionId())) {
+                body.submissionId(), mockEnabled)) {
             case ACCEPTED -> ResponseEntity.accepted().cacheControl(CacheControl.noStore())
                     .body(Map.of("status", "ACCEPTED"));
             case CONFLICT -> error(409, "answer_conflict");
@@ -203,7 +219,7 @@ public class InterviewSessionController {
         } catch (IllegalArgumentException invalid) {
             return error(400, "invalid_request");
         }
-        var result = lifecycle.change(UUID.fromString(jwt.getSubject()), id, action);
+        var result = lifecycle.change(UUID.fromString(jwt.getSubject()), id, action, mockEnabled);
         return switch (result.outcome()) {
             case OK -> ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(Map.of("status", result.status()));
             case CONFLICT -> error(409, "interview_state_conflict");
@@ -212,10 +228,11 @@ public class InterviewSessionController {
     }
 
     @DeleteMapping("/api/interviews/{id}")
-    public ResponseEntity<?> delete(@AuthenticationPrincipal Jwt jwt, @PathVariable UUID id) {
+    public ResponseEntity<?> delete(@AuthenticationPrincipal Jwt jwt, @PathVariable UUID id,
+                                    @RequestParam(defaultValue = "false") boolean confirmAbandon) {
         if (!sessionDeletionEnabled) return error(403, "interview_unavailable");
         auth.verify("Bearer " + jwt.getTokenValue());
-        if (!lifecycle.delete(UUID.fromString(jwt.getSubject()), id)) return error(404, "interview_not_found");
+        if (!lifecycle.delete(UUID.fromString(jwt.getSubject()), id, mockEnabled, confirmAbandon)) return error(404, "interview_not_found");
         return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
     }
 
