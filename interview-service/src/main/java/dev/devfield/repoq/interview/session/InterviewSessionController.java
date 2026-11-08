@@ -24,19 +24,24 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 public class InterviewSessionController {
     public record Start(UUID projectId, InterviewSessions.Mode mode, String topicKey) {}
     public record Answer(UUID questionId, String answer, String submissionId) {}
+    public record NextBundle(UUID previousBundleId, String topicKey) {}
     public record Detail(UUID interviewId, InterviewSessions.Mode mode, String status, String snapshotId,
                          String topicKey, int completedBundles,
                          @JsonInclude(JsonInclude.Include.NON_NULL) InterviewSessions.CurrentQuestion currentQuestion,
                          @JsonInclude(JsonInclude.Include.NON_NULL) List<InterviewSessions.SavedAnswer> answers,
                          @JsonInclude(JsonInclude.Include.NON_NULL) String answerProgress,
                          @JsonInclude(JsonInclude.Include.NON_NULL) String evaluationStatus,
-                         @JsonInclude(JsonInclude.Include.NON_NULL) InterviewSessions.Evaluation evaluation) {
-        static Detail from(InterviewSessions.Session session, boolean followUpEnabled) {
+                         @JsonInclude(JsonInclude.Include.NON_NULL) InterviewSessions.Evaluation evaluation,
+                         @JsonInclude(JsonInclude.Include.NON_NULL) UUID currentBundleId,
+                         @JsonInclude(JsonInclude.Include.NON_NULL) List<InterviewSessions.CompletedBundle> completedBundleHistory) {
+        static Detail from(InterviewSessions.Session session, boolean followUpEnabled, boolean showBundles) {
             boolean showAnswers = followUpEnabled || !session.answers().isEmpty();
+            showBundles = showBundles || !session.bundleId().equals(session.id());
             return new Detail(session.id(), session.mode(), session.state(), session.snapshot().snapshotId(),
-                    session.topicKey(), "READY".equals(session.evaluationStatus()) ? 1 : 0,
+                    session.topicKey(), session.completedBundles(),
                     session.currentQuestion(), showAnswers ? session.answers() : null,
-                    showAnswers ? session.answerProgress() : null, session.evaluationStatus(), session.evaluation());
+                    showAnswers ? session.answerProgress() : null, session.evaluationStatus(), session.evaluation(),
+                    showBundles ? session.bundleId() : null, showBundles ? session.completedBundleHistory() : null);
         }
     }
 
@@ -45,15 +50,20 @@ public class InterviewSessionController {
     private final InterviewSessions sessions;
     private final InterviewAnswers answers;
     private final boolean followUpEnabled;
+    private final InterviewBundles bundles;
+    private final boolean nextBundleEnabled;
 
     public InterviewSessionController(InterviewAuthentication auth, ProjectSnapshotClient snapshots,
-                                      InterviewSessions sessions, InterviewAnswers answers,
-                                      @Value("${devfield.interview.follow-up.enabled:false}") boolean followUpEnabled) {
+                                      InterviewSessions sessions, InterviewAnswers answers, InterviewBundles bundles,
+                                      @Value("${devfield.interview.follow-up.enabled:false}") boolean followUpEnabled,
+                                      @Value("${devfield.interview.next-bundle.enabled:false}") boolean nextBundleEnabled) {
         this.auth = auth;
         this.snapshots = snapshots;
         this.sessions = sessions;
         this.answers = answers;
         this.followUpEnabled = followUpEnabled;
+        this.bundles = bundles;
+        this.nextBundleEnabled = nextBundleEnabled;
     }
 
     @PostMapping("/api/interviews")
@@ -70,16 +80,16 @@ public class InterviewSessionController {
 
         var session = sessions.create(UUID.fromString(jwt.getSubject()), request.projectId(), request.mode(), snapshot, topic);
         return ResponseEntity.created(URI.create("/api/interviews/" + session.id())).cacheControl(CacheControl.noStore())
-                .body(Detail.from(session, followUpEnabled));
+                .body(Detail.from(session, followUpEnabled, nextBundleEnabled));
     }
 
     @GetMapping("/api/interviews/{id}")
     public ResponseEntity<?> find(@AuthenticationPrincipal Jwt jwt, @PathVariable UUID id) {
         auth.verify("Bearer " + jwt.getTokenValue());
-        var session = sessions.find(UUID.fromString(jwt.getSubject()), id)
+        var session = sessions.find(UUID.fromString(jwt.getSubject()), id, nextBundleEnabled)
                 .filter(found -> found.mode() == InterviewSessions.Mode.FREE);
         if (session.isEmpty()) return error(404, "interview_not_found");
-        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(Detail.from(session.get(), followUpEnabled));
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(Detail.from(session.get(), followUpEnabled, nextBundleEnabled));
     }
 
     @PostMapping("/api/interviews/{id}/answers")
@@ -97,6 +107,24 @@ public class InterviewSessionController {
                     .body(Map.of("status", "ACCEPTED"));
             case CONFLICT -> error(409, "answer_conflict");
             case NOT_FOUND -> error(404, "interview_not_found");
+        };
+    }
+
+    @PostMapping("/api/interviews/{id}/bundles")
+    public ResponseEntity<?> nextBundle(@AuthenticationPrincipal Jwt jwt, @PathVariable UUID id, @RequestBody NextBundle body) {
+        if (!nextBundleEnabled) return error(403, "interview_unavailable");
+        auth.verify("Bearer " + jwt.getTokenValue());
+        if (body.previousBundleId() == null || body.topicKey() == null || !body.topicKey().matches("[A-Z][A-Z0-9_]{0,63}")) {
+            return error(400, "invalid_request");
+        }
+        var result = bundles.request(UUID.fromString(jwt.getSubject()), id, body.previousBundleId(), body.topicKey());
+        return switch (result.status()) {
+            case ACCEPTED -> ResponseEntity.accepted().cacheControl(CacheControl.noStore())
+                    .body(Map.of("bundleId", result.bundleId(), "status", "ACCEPTED"));
+            case CONFLICT -> error(409, "bundle_conflict");
+            case NOT_FOUND -> error(404, "interview_not_found");
+            case INVALID_TOPIC -> error(400, "invalid_topic");
+            case UNAVAILABLE -> error(503, "interview_unavailable");
         };
     }
 

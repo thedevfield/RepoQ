@@ -44,6 +44,8 @@ FREE answer submission and follow-ups are disabled by default. Set `INTERVIEW_FO
 
 Set `INTERVIEW_EVALUATION_ENABLED=true` with the session, follow-up and Ollama flags to enable FREE first-bundle evaluation. Normal question closure queues evaluation; existing closed bundles are not queued retroactively. I-03 reports `evaluationStatus` as `PENDING`, `READY` or `FAILED` for evaluation jobs. It includes the qualitative `evaluation` and reports `completedBundles: 1` only after successful publication. Stored answers remain available on failure.
 
+Set `INTERVIEW_NEXT_BUNDLE_ENABLED=true` with the session, follow-up, evaluation and Ollama flags to enable FREE I-05. I-03 exposes `currentBundleId`, `completedBundleHistory` and the number of READY evaluations. Submit `previousBundleId` and a pinned Snapshot `topicKey` (or `RANDOM`) to `/api/interviews/{id}/bundles` after the current evaluation is READY. The first request and an identical replay return `202` with the same successor `bundleId`. A different topic for that predecessor or a request before evaluation completes returns `409`.
+
 ## Interview deletion (X-02 / X-04)
 
 Persist the first `deletionJobId` for the target and reuse it on every retry, including after a timeout or lost response. Once a deletion fence binds a target to a job ID, a different job ID for that target returns `409 deletion_conflict`, even after completion. A retry with the original ID returns `204 No Content` once cleanup is committed.

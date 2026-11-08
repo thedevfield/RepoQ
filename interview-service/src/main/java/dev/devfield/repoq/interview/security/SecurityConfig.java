@@ -19,7 +19,8 @@ public class SecurityConfig {
     @Bean
     SecurityFilterChain securityFilterChain(HttpSecurity http, DeletionCredentials credentials,
             @Value("${devfield.interview.sessions.enabled:false}") boolean sessionsEnabled,
-            @Value("${devfield.interview.follow-up.enabled:false}") boolean followUpEnabled) throws Exception {
+            @Value("${devfield.interview.follow-up.enabled:false}") boolean followUpEnabled,
+            @Value("${devfield.interview.next-bundle.enabled:false}") boolean nextBundleEnabled) throws Exception {
         return http.csrf(csrf -> csrf.disable())
                 .httpBasic(basic -> basic.disable())
                 .formLogin(form -> form.disable())
@@ -28,6 +29,9 @@ public class SecurityConfig {
                     if (sessionsEnabled) {
                         authorize.requestMatchers(HttpMethod.POST, "/api/interviews").authenticated()
                                 .requestMatchers(HttpMethod.GET, "/api/interviews/*").authenticated();
+                        if (nextBundleEnabled) {
+                            authorize.requestMatchers(HttpMethod.POST, "/api/interviews/*/bundles").authenticated();
+                        }
                         if (followUpEnabled) {
                             authorize.requestMatchers(HttpMethod.POST, "/api/interviews/*/answers").authenticated();
                         }
