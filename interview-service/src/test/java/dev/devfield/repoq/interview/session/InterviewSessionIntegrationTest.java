@@ -391,6 +391,12 @@ class InterviewSessionIntegrationTest {
         assertEquals(1L, db.queryForObject("SELECT membership_version FROM interview.interview_session WHERE id=?", Long.class, id));
     }
 
+    @Test void answerRouteIsDisabledByDefaultEvenWithSessionsEnabled() throws Exception {
+        var request = request("/api/interviews/" + UUID.randomUUID() + "/answers", bearer("fixture", owner))
+                .header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString("{}")).build();
+        assertEquals(403, http.send(request, HttpResponse.BodyHandlers.discarding()).statusCode());
+    }
+
     @Test void lowercaseBearerUsesCanonicalSchemeForBothEndpoints() throws Exception {
         String canonical = bearer("fixture", owner);
         String lowercase = "bearer " + canonical.substring(7);

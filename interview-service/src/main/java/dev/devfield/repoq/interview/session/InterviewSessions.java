@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.devfield.repoq.interview.project.ProjectSnapshot;
 import java.time.OffsetDateTime;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -21,9 +22,11 @@ public class InterviewSessions {
 
     public record CurrentQuestion(UUID id, String text, String topicKey) {}
 
+    public record SavedAnswer(UUID questionId, String question, String answer) {}
+
     public record Session(UUID id, UUID ownerUserId, UUID projectId, ProjectSnapshot snapshot,
                           Mode mode, String state, String topicKey, long version, OffsetDateTime createdAt,
-                          CurrentQuestion currentQuestion) {}
+                          CurrentQuestion currentQuestion, List<SavedAnswer> answers, String answerProgress) {}
 
     public static final class WriteBlocked extends RuntimeException {}
     public static final class DeletionConflict extends RuntimeException {}
@@ -76,7 +79,7 @@ public class InterviewSessions {
                         VALUES (?,?,?)
                         """, id, resolved.key(), UUID.fromString(resolved.primaryEvidenceId()));
             }
-            return new Session(id, owner, project, snapshot, mode, "PREPARING", topicKey, 1, created, null);
+            return new Session(id, owner, project, snapshot, mode, "PREPARING", topicKey, 1, created, null, List.of(), null);
         });
     }
 
@@ -84,9 +87,29 @@ public class InterviewSessions {
         return db.query("""
                 SELECT s.id, s.owner_user_id, s.project_id, s.snapshot_context::text, s.mode,
                        s.state, s.requested_topic_key, s.version, s.created_at,
-                       j.question_id, j.question_text, j.resolved_topic_key
+                       CASE WHEN latest.state IS NULL THEN latest.id END, latest.question_text, latest.topic_key,
+                       CASE
+                           WHEN latest.id IS NULL THEN NULL
+                           WHEN latest.state IS NULL THEN 'AWAITING_ANSWER'
+                           WHEN latest.state='STOPPED' THEN 'QUESTIONS_COMPLETE'
+                           WHEN latest.state='FAILED' THEN 'FOLLOW_UP_FAILED'
+                           ELSE 'FOLLOW_UP_PENDING'
+                       END,
+                       history.answers::text
                 FROM interview.interview_session s
-                LEFT JOIN interview.first_question_job j ON j.session_id=s.id AND j.state='READY'
+                LEFT JOIN LATERAL (
+                    SELECT q.id,q.question_text,q.topic_key,a.state
+                    FROM interview.question_turn q
+                    LEFT JOIN interview.user_answer a ON a.session_id=q.session_id AND a.question_id=q.id
+                    WHERE q.session_id=s.id ORDER BY q.position DESC LIMIT 1
+                ) latest ON true
+                LEFT JOIN LATERAL (
+                    SELECT COALESCE(jsonb_agg(jsonb_build_object('questionId',q.id,'question',q.question_text,
+                        'answer',a.answer_text) ORDER BY q.position),'[]'::jsonb) AS answers
+                    FROM interview.question_turn q JOIN interview.user_answer a
+                        ON a.session_id=q.session_id AND a.question_id=q.id
+                    WHERE q.session_id=s.id
+                ) history ON true
                 JOIN interview.interview_write_fence u ON u.scope='USER' AND u.owner_user_id=s.owner_user_id
                 JOIN interview.interview_write_fence p ON p.scope='PROJECT' AND p.project_id=s.project_id
                     AND p.owner_user_id=s.owner_user_id
@@ -95,7 +118,7 @@ public class InterviewSessions {
                 rs.getObject(3, UUID.class), decode(rs.getString(4)), Mode.valueOf(rs.getString(5)),
                 rs.getString(6), rs.getString(7), rs.getLong(8), rs.getObject(9, OffsetDateTime.class),
                 rs.getObject(10, UUID.class) == null ? null : new CurrentQuestion(rs.getObject(10, UUID.class),
-                        rs.getString(11), rs.getString(12))), sessionId, owner).stream().findFirst();
+                        rs.getString(11), rs.getString(12)), decodeAnswers(rs.getString(14)), rs.getString(13)), sessionId, owner).stream().findFirst();
     }
 
     public void deleteProject(UUID owner, UUID project, UUID job) {
@@ -175,6 +198,14 @@ public class InterviewSessions {
 
     private static void requireJob(Fence fence, UUID job) {
         if (!job.equals(fence.job())) throw new DeletionConflict();
+    }
+
+    private List<SavedAnswer> decodeAnswers(String value) {
+        try {
+            return json.readValue(value, json.getTypeFactory().constructCollectionType(List.class, SavedAnswer.class));
+        } catch (JsonProcessingException invalid) {
+            throw new IllegalStateException("Invalid stored interview answers", invalid);
+        }
     }
 
     private String encode(ProjectSnapshot snapshot) {
