@@ -43,14 +43,15 @@ class InterviewAnswers {
                 return previous.getFirst().equals(new Submission(question, answer)) ? Result.ACCEPTED : Result.CONFLICT;
             }
             if (!"ACTIVE".equals(state)) return Result.CONFLICT;
+            UUID bundle = currentBundle(session);
             int inserted = db.update("""
                     INSERT INTO interview.user_answer(session_id,question_id,submission_id,answer_text,state)
                     SELECT session_id,id,?,?,CASE WHEN position=3 THEN 'STOPPED' ELSE 'QUEUED' END
                     FROM interview.question_turn
-                    WHERE session_id=? AND id=? AND position=(
-                        SELECT max(position) FROM interview.question_turn WHERE session_id=?)
+                    WHERE bundle_id=? AND id=? AND position=(
+                        SELECT max(position) FROM interview.question_turn WHERE bundle_id=?)
                     ON CONFLICT (session_id,question_id) DO NOTHING
-                    """, submissionId, answer, session, question, session);
+                    """, submissionId, answer, bundle, question, bundle);
             if (inserted == 0) return Result.CONFLICT;
             enqueueEvaluationIfStopped(session, question);
             return Result.ACCEPTED;
@@ -60,11 +61,18 @@ class InterviewAnswers {
     void enqueueEvaluationIfStopped(UUID session, UUID question) {
         if (!evaluationEnabled) return;
         db.update("""
-                INSERT INTO interview.bundle_evaluation(session_id,closing_question_id)
-                SELECT session_id,question_id FROM interview.user_answer
-                WHERE session_id=? AND question_id=? AND state='STOPPED'
-                ON CONFLICT (session_id) DO NOTHING
+                INSERT INTO interview.bundle_evaluation(session_id,bundle_id,closing_question_id)
+                SELECT a.session_id,q.bundle_id,a.question_id FROM interview.user_answer a
+                JOIN interview.question_turn q ON q.session_id=a.session_id AND q.id=a.question_id
+                WHERE a.session_id=? AND a.question_id=? AND a.state='STOPPED'
+                ON CONFLICT (bundle_id) DO NOTHING
                 """, session, question);
+    }
+
+    UUID currentBundle(UUID session) {
+        return db.queryForObject("""
+                SELECT id FROM interview.question_bundle WHERE session_id=? ORDER BY sequence DESC LIMIT 1
+                """, UUID.class, session);
     }
 
     String lockSession(Target target) {

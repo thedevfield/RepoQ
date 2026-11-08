@@ -21,7 +21,7 @@ class FollowUpWorker {
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).build();
 
     record Turn(String question, String answer) {}
-    private record Job(InterviewAnswers.Target target, UUID question) {}
+    private record Job(InterviewAnswers.Target target, UUID question, UUID bundle) {}
     private record Pending(int attempt, int position, String topic, UUID evidence) {}
     private record Claim(Job job, Pending pending, FirstQuestionGenerator.Input fact, List<Turn> turns) {}
     private record Outcome(String state, String question) {}
@@ -45,16 +45,18 @@ class FollowUpWorker {
             initialDelayString = "${devfield.interview.follow-up.poll-ms:1000}")
     public void poll() {
         var due = db.query("""
-                SELECT a.session_id,s.owner_user_id,s.project_id,a.question_id
+                SELECT a.session_id,s.owner_user_id,s.project_id,a.question_id,q.bundle_id
                 FROM interview.user_answer a JOIN interview.interview_session s ON s.id=a.session_id
+                JOIN interview.question_turn q ON q.session_id=a.session_id AND q.id=a.question_id
                 JOIN interview.interview_write_fence u ON u.scope='USER' AND u.owner_user_id=s.owner_user_id AND u.state='ACTIVE'
                 JOIN interview.interview_write_fence p ON p.scope='PROJECT' AND p.project_id=s.project_id
                     AND p.owner_user_id=s.owner_user_id AND p.state='ACTIVE'
                 WHERE s.mode='FREE' AND s.state='ACTIVE' AND a.state IN ('QUEUED','RUNNING')
                     AND a.due_at<=clock_timestamp()
+                    AND q.bundle_id=(SELECT id FROM interview.question_bundle WHERE session_id=s.id ORDER BY sequence DESC LIMIT 1)
                 ORDER BY a.due_at,a.session_id LIMIT 1
                 """, (rs, row) -> new Job(new InterviewAnswers.Target(rs.getObject(1, UUID.class),
-                rs.getObject(2, UUID.class), rs.getObject(3, UUID.class)), rs.getObject(4, UUID.class)));
+                rs.getObject(2, UUID.class), rs.getObject(3, UUID.class)), rs.getObject(4, UUID.class), rs.getObject(5, UUID.class)));
         if (due.isEmpty()) return;
 
         Claim claim = tx.execute(status -> claim(due.getFirst()));
@@ -100,8 +102,8 @@ class FollowUpWorker {
         var turns = db.query("""
                 SELECT q.question_text,a.answer_text FROM interview.question_turn q
                 JOIN interview.user_answer a ON a.session_id=q.session_id AND a.question_id=q.id
-                WHERE q.session_id=? AND q.position<=? ORDER BY q.position
-                """, (rs, row) -> new Turn(rs.getString(1), rs.getString(2)), session, pending.position());
+                WHERE q.bundle_id=? AND q.position<=? ORDER BY q.position
+                """, (rs, row) -> new Turn(rs.getString(1), rs.getString(2)), job.bundle(), pending.position());
         db.update("""
                 UPDATE interview.user_answer SET state='RUNNING',attempt=?,
                     lease_until=clock_timestamp()+interval '30 seconds',due_at=clock_timestamp()+interval '30 seconds'
@@ -126,16 +128,17 @@ class FollowUpWorker {
         }
         if (updated == 1 && "PUBLISHED".equals(outcome.state())) {
             db.update("""
-                    INSERT INTO interview.question_turn(session_id,position,id,topic_key,evidence_id,question_text)
-                    VALUES (?,?,?,?,?,?)
-                    """, session, claim.pending().position() + 1, UUID.randomUUID(), claim.pending().topic(),
+                    INSERT INTO interview.question_turn(session_id,bundle_id,position,id,topic_key,evidence_id,question_text)
+                    VALUES (?,?,?,?,?,?,?)
+                    """, session, claim.job().bundle(), claim.pending().position() + 1, UUID.randomUUID(), claim.pending().topic(),
                     claim.pending().evidence(), outcome.question());
         }
     }
 
     private boolean lockActive(Job job) {
         try {
-            return "ACTIVE".equals(answers.lockSession(job.target()));
+            return "ACTIVE".equals(answers.lockSession(job.target()))
+                    && job.bundle().equals(answers.currentBundle(job.target().session()));
         } catch (InterviewSessions.WriteBlocked | InterviewSessions.DeletionConflict blocked) {
             return false;
         }

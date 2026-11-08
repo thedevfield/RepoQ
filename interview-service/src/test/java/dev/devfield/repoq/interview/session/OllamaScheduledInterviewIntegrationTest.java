@@ -24,6 +24,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -66,6 +67,7 @@ class OllamaScheduledInterviewIntegrationTest {
     private static final String SNAPSHOT_ID = UUID.randomUUID().toString();
     private static final String TOKEN = "fixture." + OWNER + ".signature";
     private static final String SUMMARY = "Declares a Java class.";
+    private static final AtomicInteger SNAPSHOT_CALLS = new AtomicInteger();
     private static final AtomicReference<JsonNode> OLLAMA_REQUEST = new AtomicReference<>();
     private record Reply(int status, String content, CountDownLatch entered, CountDownLatch release) {
         Reply(int status, String content) { this(status, content, null, null); }
@@ -73,6 +75,7 @@ class OllamaScheduledInterviewIntegrationTest {
 
     private static final AtomicReference<Reply> FOLLOW_UP_REPLY = new AtomicReference<>();
     private static final AtomicReference<JsonNode> FOLLOW_UP_REQUEST = new AtomicReference<>();
+    private static final AtomicReference<Reply> MAIN_REPLY = new AtomicReference<>();
     private static final AtomicReference<Reply> EVALUATION_REPLY = new AtomicReference<>();
     private static final AtomicReference<JsonNode> EVALUATION_REQUEST = new AtomicReference<>();
     private static HttpServer upstream;
@@ -107,6 +110,7 @@ class OllamaScheduledInterviewIntegrationTest {
         });
         upstream.createContext("/internal/projects/" + PROJECT + "/interview-data", exchange -> {
             try (exchange) {
+                SNAPSHOT_CALLS.incrementAndGet();
                 String member = UUID.randomUUID().toString();
                 String repository = UUID.randomUUID().toString();
                 String sha = "a".repeat(40);
@@ -134,6 +138,7 @@ class OllamaScheduledInterviewIntegrationTest {
                     reply = FOLLOW_UP_REPLY.get();
                 } else {
                     OLLAMA_REQUEST.set(request);
+                    reply = MAIN_REPLY.get();
                 }
                 if (reply != null) {
                     if (reply.entered() != null) {
@@ -172,8 +177,18 @@ class OllamaScheduledInterviewIntegrationTest {
         db.update("DELETE FROM interview.interview_write_fence WHERE owner_user_id=?", OWNER);
         FOLLOW_UP_REPLY.set(null);
         FOLLOW_UP_REQUEST.set(null);
+        SNAPSHOT_CALLS.set(0);
+        MAIN_REPLY.set(null);
         EVALUATION_REPLY.set(null);
         EVALUATION_REQUEST.set(null);
+    }
+
+    @Test
+    void nextBundleIsDisabledByDefault() throws Exception {
+        try (var http = HttpClient.newHttpClient()) {
+            UUID id = start(http);
+            assertEquals(403, next(http, id, id.toString(), "JAVA").statusCode());
+        }
     }
 
     @Test
@@ -408,12 +423,75 @@ class OllamaScheduledInterviewIntegrationTest {
     @TestPropertySource(properties = {
             "devfield.interview.follow-up.poll-ms=100",
             "devfield.interview.evaluation.enabled=true",
-            "devfield.interview.evaluation.poll-ms=100"
+            "devfield.interview.evaluation.poll-ms=100",
+            "devfield.interview.next-bundle.enabled=true"
     })
     @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
     class ScheduledFollowUp {
         @LocalServerPort int scheduledPort;
         @MockitoBean JwtDecoder scheduledDecoder;
+
+        @Test
+        void nextBundleReusesPinnedSnapshotAndPublishesSecondEvaluation() throws Exception {
+            port = scheduledPort;
+            FOLLOW_UP_REPLY.set(new Reply(200, outcome("STOP", "", EVIDENCE)));
+            EVALUATION_REPLY.set(new Reply(200, evaluation(EVIDENCE, "First evaluation.")));
+            try (var http = HttpClient.newHttpClient(); var executor = Executors.newFixedThreadPool(2)) {
+                UUID id = start(http, scheduledDecoder);
+                var first = detail(http, id);
+                String previous = first.path("currentBundleId").asText();
+                String firstQuestion = first.at("/currentQuestion/id").asText();
+                String firstQuestionText = first.at("/currentQuestion/text").asText();
+                assertEquals(409, next(http, id, previous, "RANDOM").statusCode());
+                assertEquals(202, submit(http, id, firstQuestion, "first answer", "bundle-one"));
+                assertEquals(1, awaitEvaluation(http, id, "READY").path("completedBundles").asInt());
+                assertEquals(400, next(http, id, previous, "UNKNOWN").statusCode());
+
+                MAIN_REPLY.set(new Reply(200, JSON.valueToTree(Map.of(
+                        "question", "How would you verify this choice?", "evidenceId", EVIDENCE)).toString()));
+                var left = executor.submit(() -> next(http, id, previous, "RANDOM"));
+                var right = executor.submit(() -> next(http, id, previous, "RANDOM"));
+                var accepted = left.get(10, TimeUnit.SECONDS);
+                var replay = right.get(10, TimeUnit.SECONDS);
+                assertEquals(202, accepted.statusCode(), accepted.body());
+                assertEquals(202, replay.statusCode(), replay.body());
+                String successor = JSON.readTree(accepted.body()).path("bundleId").asText();
+                assertNotEquals(previous, successor);
+                assertEquals(successor, JSON.readTree(replay.body()).path("bundleId").asText());
+                assertEquals(409, next(http, id, previous, "JAVA").statusCode());
+
+                var second = awaitActive(http, id);
+                assertEquals(successor, second.path("currentBundleId").asText());
+                assertEquals(SNAPSHOT_ID, second.path("snapshotId").asText());
+                assertEquals("JAVA", second.at("/currentQuestion/topicKey").asText());
+                assertEquals("How would you verify this choice?", second.at("/currentQuestion/text").asText());
+                assertEquals("First evaluation.", second.at("/completedBundleHistory/0/evaluation/strengths").asText());
+                assertEquals(1, second.path("completedBundles").asInt());
+                assertTrue(second.path("answers").isEmpty());
+                var mainInput = JSON.readTree(OLLAMA_REQUEST.get().at("/messages/1/content").asText());
+                assertEquals(EVIDENCE.toString(), mainInput.path("evidenceId").asText());
+                assertEquals(firstQuestionText, mainInput.at("/previousQuestions/0").asText());
+
+                assertEquals(202, submit(http, id, firstQuestion, "first answer", "bundle-one"));
+                assertEquals(409, submit(http, id, firstQuestion, "another answer", "wrong-bundle"));
+                EVALUATION_REPLY.set(new Reply(200, evaluation(EVIDENCE, "Second evaluation.")));
+                assertEquals(202, submit(http, id, second.at("/currentQuestion/id").asText(), "second answer", "bundle-two"));
+                var finished = awaitEvaluation(http, id, "READY");
+                assertEquals(2, finished.path("completedBundles").asInt());
+                assertEquals("first answer", finished.at("/completedBundleHistory/0/answers/0/answer").asText());
+                assertEquals("Second evaluation.", finished.at("/completedBundleHistory/1/evaluation/strengths").asText());
+                var input = JSON.readTree(EVALUATION_REQUEST.get().at("/messages/1/content").asText());
+                assertEquals(1, input.path("turns").size());
+                assertEquals("second answer", input.at("/turns/0/answer").asText());
+
+                var third = next(http, id, successor, "JAVA");
+                assertEquals(202, third.statusCode(), third.body());
+                var lateReplay = next(http, id, previous, "RANDOM");
+                assertEquals(202, lateReplay.statusCode(), lateReplay.body());
+                assertEquals(successor, JSON.readTree(lateReplay.body()).path("bundleId").asText());
+                assertEquals(1, SNAPSHOT_CALLS.get());
+            }
+        }
 
         @Test
         void scheduledEvaluationPublishesOnlyAfterNormalStop() throws Exception {
@@ -486,7 +564,9 @@ class OllamaScheduledInterviewIntegrationTest {
     @Nested
     @TestPropertySource(properties = {
             "devfield.interview.evaluation.enabled=true",
-            "devfield.interview.evaluation.poll-ms=3600000"
+            "devfield.interview.evaluation.poll-ms=3600000",
+            "devfield.interview.first-question.poll-ms=3600000",
+            "devfield.interview.next-bundle.enabled=true"
     })
     @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
     class EvaluationRaces {
@@ -494,12 +574,13 @@ class OllamaScheduledInterviewIntegrationTest {
         @MockitoBean JwtDecoder evaluationDecoder;
         @Autowired BundleEvaluationWorker worker;
         @Autowired FollowUpWorker closingWorker;
+        @Autowired FirstQuestionWorker mainWorker;
 
         @Test
         void thirdFollowUpClosesBundleAndQueuesOnce() throws Exception {
             port = evaluationPort;
             try (var http = HttpClient.newHttpClient()) {
-                UUID id = start(http, evaluationDecoder);
+                UUID id = start(http, evaluationDecoder, mainWorker::poll);
                 for (int i = 0; i < 4; i++) {
                     String question = detail(http, id).at("/currentQuestion/id").asText();
                     assertEquals(202, submit(http, id, question, "answer " + i, "turn-" + i));
@@ -624,8 +705,52 @@ class OllamaScheduledInterviewIntegrationTest {
             }
         }
 
+        @ParameterizedTest @ValueSource(booleans = {false, true})
+        void deletionFencesNextBundleAndLateMainQuestion(boolean userDeletion) throws Exception {
+            port = evaluationPort;
+            try (var http = HttpClient.newHttpClient(); var executor = Executors.newSingleThreadExecutor()) {
+                UUID id = closeNormally(http);
+                EVALUATION_REPLY.set(new Reply(200, evaluation(EVIDENCE, "Prior evaluation.")));
+                worker.poll();
+                String predecessor = detail(http, id).path("currentBundleId").asText();
+                var accepted = next(http, id, predecessor, "JAVA");
+                assertEquals(202, accepted.statusCode(), accepted.body());
+                UUID successor = UUID.fromString(JSON.readTree(accepted.body()).path("bundleId").asText());
+
+                var entered = new CountDownLatch(1);
+                var release = new CountDownLatch(1);
+                MAIN_REPLY.set(new Reply(200, OllamaFirstQuestionGeneratorTest.content(EVIDENCE), entered, release));
+                String blocker = "interview.test_next_bundle_" + id.toString().replace("-", "");
+                UUID job = UUID.randomUUID();
+                db.execute("CREATE TABLE " + blocker + " (id uuid REFERENCES interview.interview_session(id))");
+                try {
+                    db.update("INSERT INTO " + blocker + " VALUES (?)", id);
+                    var running = executor.submit(mainWorker::poll);
+                    try {
+                        assertTrue(entered.await(5, TimeUnit.SECONDS));
+                        assertEquals(503, delete(http, userDeletion, job));
+                        assertEquals(409, next(http, id, predecessor, "JAVA").statusCode());
+                        assertEquals(409, next(http, id, successor.toString(), "JAVA").statusCode());
+                        assertEquals(404, http.send(request("/api/interviews/" + id).GET().build(),
+                                HttpResponse.BodyHandlers.discarding()).statusCode());
+                    } finally {
+                        release.countDown();
+                    }
+                    running.get(10, TimeUnit.SECONDS);
+                    assertEquals(0, db.queryForObject("SELECT count(*) FROM interview.question_turn WHERE bundle_id=?",
+                            Integer.class, successor));
+                } finally {
+                    db.execute("DROP TABLE " + blocker);
+                }
+                assertEquals(204, delete(http, userDeletion, job));
+                assertEquals(0, db.queryForObject("SELECT count(*) FROM interview.question_bundle WHERE session_id=?",
+                        Integer.class, id));
+                assertEquals(0, evaluationCount(id));
+            }
+        }
+
         private UUID closeNormally(HttpClient http) throws Exception {
-            UUID id = start(http, evaluationDecoder);
+            UUID id = start(http, evaluationDecoder, mainWorker::poll);
             String question = detail(http, id).at("/currentQuestion/id").asText();
             assertEquals(202, submit(http, id, question, "saved answer", "evaluation"));
             FOLLOW_UP_REPLY.set(new Reply(200, outcome("STOP", "", EVIDENCE)));
@@ -730,6 +855,10 @@ class OllamaScheduledInterviewIntegrationTest {
     }
 
     private UUID start(HttpClient http, JwtDecoder jwtDecoder) throws Exception {
+        return start(http, jwtDecoder, () -> {});
+    }
+
+    private UUID start(HttpClient http, JwtDecoder jwtDecoder, Runnable afterSubmit) throws Exception {
         when(jwtDecoder.decode(TOKEN)).thenReturn(Jwt.withTokenValue(TOKEN).header("alg", "RS256")
                 .subject(OWNER.toString()).issuedAt(Instant.now().minusSeconds(1))
                 .expiresAt(Instant.now().plusSeconds(120)).build());
@@ -739,9 +868,16 @@ class OllamaScheduledInterviewIntegrationTest {
                 HttpResponse.BodyHandlers.ofString());
         assertEquals(201, response.statusCode(), response.body());
         UUID id = UUID.fromString(JSON.readTree(response.body()).path("interviewId").asText());
+        afterSubmit.run();
+        awaitActive(http, id);
+        return id;
+    }
+
+    private JsonNode awaitActive(HttpClient http, UUID id) throws Exception {
         long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
         do {
-            if ("ACTIVE".equals(detail(http, id).path("status").asText())) return id;
+            var result = detail(http, id);
+            if ("ACTIVE".equals(result.path("status").asText())) return result;
             Thread.sleep(50);
         } while (System.nanoTime() < deadline);
         throw new AssertionError("First question did not become ACTIVE");
@@ -758,6 +894,12 @@ class OllamaScheduledInterviewIntegrationTest {
                 .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(Map.of(
                         "questionId", question, "answer", answer, "submissionId", submission)))).build(),
                 HttpResponse.BodyHandlers.discarding()).statusCode();
+    }
+
+    private HttpResponse<String> next(HttpClient http, UUID id, String previous, String topic) throws Exception {
+        return http.send(request("/api/interviews/" + id + "/bundles").header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(Map.of(
+                        "previousBundleId", previous, "topicKey", topic)))).build(), HttpResponse.BodyHandlers.ofString());
     }
 
     private int delete(HttpClient http, boolean userDeletion, UUID job) throws Exception {

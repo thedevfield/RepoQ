@@ -27,10 +27,14 @@ public class InterviewSessions {
     public record Evaluation(UUID evidenceId, String strengths, String gaps, String improvements,
                              String exampleAnswer, String keyPoints, String limitations) {}
 
+    public record CompletedBundle(UUID bundleId, int sequence, String topicKey,
+                                  List<SavedAnswer> answers, Evaluation evaluation) {}
+
     public record Session(UUID id, UUID ownerUserId, UUID projectId, ProjectSnapshot snapshot,
                           Mode mode, String state, String topicKey, long version, OffsetDateTime createdAt,
                           CurrentQuestion currentQuestion, List<SavedAnswer> answers, String answerProgress,
-                          String evaluationStatus, Evaluation evaluation) {}
+                          String evaluationStatus, Evaluation evaluation, UUID bundleId, int completedBundles,
+                          List<CompletedBundle> completedBundleHistory) {}
 
     public static final class WriteBlocked extends RuntimeException {}
     public static final class DeletionConflict extends RuntimeException {}
@@ -73,24 +77,36 @@ public class InterviewSessions {
                     RETURNING created_at
                     """, OffsetDateTime.class, id, owner, project, mode.name(), snapshotId,
                     snapshot.membershipVersion(), context, topicKey);
+            db.update("""
+                    INSERT INTO interview.question_bundle(id,session_id,sequence,requested_topic_key)
+                    VALUES (?,?,1,?)
+                    """, id, id, topicKey);
             if (generateFirstQuestion && mode == Mode.FREE && topicKey != null) {
                 var topics = snapshot.topics();
                 var resolved = "RANDOM".equals(topicKey)
                         ? topics.get(ThreadLocalRandom.current().nextInt(topics.size()))
                         : topics.stream().filter(topic -> topic.key().equals(topicKey)).findFirst().orElseThrow();
-                db.update("""
-                        INSERT INTO interview.first_question_job(session_id,resolved_topic_key,evidence_id)
-                        VALUES (?,?,?)
-                        """, id, resolved.key(), UUID.fromString(resolved.primaryEvidenceId()));
+                enqueueMainQuestion(id, id, resolved);
             }
-            return new Session(id, owner, project, snapshot, mode, "PREPARING", topicKey, 1, created, null, List.of(), null, null, null);
+            return new Session(id, owner, project, snapshot, mode, "PREPARING", topicKey, 1, created, null, List.of(), null, null, null, id, 0, List.of());
         });
     }
 
+    void enqueueMainQuestion(UUID session, UUID bundle, ProjectSnapshot.Topic topic) {
+        db.update("""
+                INSERT INTO interview.first_question_job(session_id,bundle_id,resolved_topic_key,evidence_id)
+                VALUES (?,?,?,?)
+                """, session, bundle, topic.key(), UUID.fromString(topic.primaryEvidenceId()));
+    }
+
     public Optional<Session> find(UUID owner, UUID sessionId) {
+        return find(owner, sessionId, false);
+    }
+
+    Optional<Session> find(UUID owner, UUID sessionId, boolean includeHistory) {
         return db.query("""
                 SELECT s.id, s.owner_user_id, s.project_id, s.snapshot_context::text, s.mode,
-                       s.state, s.requested_topic_key, s.version, s.created_at,
+                       s.state, bundle.requested_topic_key, s.version, s.created_at,
                        CASE WHEN latest.state IS NULL THEN latest.id END, latest.question_text, latest.topic_key,
                        CASE
                            WHEN latest.id IS NULL THEN NULL
@@ -101,22 +117,43 @@ public class InterviewSessions {
                        END,
                        history.answers::text,
                        CASE WHEN evaluation.state IN ('QUEUED','RUNNING') THEN 'PENDING' ELSE evaluation.state END,
-                       evaluation.result::text
+                       evaluation.result::text, bundle.id,
+                       (SELECT count(*) FROM interview.bundle_evaluation e WHERE e.session_id=s.id AND e.state='READY'),
+                       CASE WHEN ? OR bundle.id<>s.id THEN (
+                           SELECT COALESCE(jsonb_agg(jsonb_build_object('bundleId',b.id,'sequence',b.sequence,
+                               'topicKey',main.resolved_topic_key,'answers',saved.answers,
+                               'evaluation',e.result) ORDER BY b.sequence),'[]'::jsonb)
+                           FROM interview.question_bundle b
+                           JOIN interview.bundle_evaluation e ON e.bundle_id=b.id AND e.state='READY'
+                           JOIN interview.first_question_job main ON main.bundle_id=b.id
+                           JOIN LATERAL (
+                               SELECT jsonb_agg(jsonb_build_object('questionId',q.id,'question',q.question_text,
+                                   'answer',a.answer_text) ORDER BY q.position) AS answers
+                               FROM interview.question_turn q JOIN interview.user_answer a
+                                   ON a.session_id=q.session_id AND a.question_id=q.id
+                               WHERE q.bundle_id=b.id
+                           ) saved ON true
+                           WHERE b.session_id=s.id
+                       ) ELSE '[]'::jsonb END::text
                 FROM interview.interview_session s
+                JOIN LATERAL (
+                    SELECT id,requested_topic_key FROM interview.question_bundle
+                    WHERE session_id=s.id ORDER BY sequence DESC LIMIT 1
+                ) bundle ON true
                 LEFT JOIN LATERAL (
                     SELECT q.id,q.question_text,q.topic_key,a.state
                     FROM interview.question_turn q
                     LEFT JOIN interview.user_answer a ON a.session_id=q.session_id AND a.question_id=q.id
-                    WHERE q.session_id=s.id ORDER BY q.position DESC LIMIT 1
+                    WHERE q.bundle_id=bundle.id ORDER BY q.position DESC LIMIT 1
                 ) latest ON true
                 LEFT JOIN LATERAL (
                     SELECT COALESCE(jsonb_agg(jsonb_build_object('questionId',q.id,'question',q.question_text,
                         'answer',a.answer_text) ORDER BY q.position),'[]'::jsonb) AS answers
                     FROM interview.question_turn q JOIN interview.user_answer a
                         ON a.session_id=q.session_id AND a.question_id=q.id
-                    WHERE q.session_id=s.id
+                    WHERE q.bundle_id=bundle.id
                 ) history ON true
-                LEFT JOIN interview.bundle_evaluation evaluation ON evaluation.session_id=s.id
+                LEFT JOIN interview.bundle_evaluation evaluation ON evaluation.bundle_id=bundle.id
                 JOIN interview.interview_write_fence u ON u.scope='USER' AND u.owner_user_id=s.owner_user_id
                 JOIN interview.interview_write_fence p ON p.scope='PROJECT' AND p.project_id=s.project_id
                     AND p.owner_user_id=s.owner_user_id
@@ -125,8 +162,10 @@ public class InterviewSessions {
                 rs.getObject(3, UUID.class), decode(rs.getString(4)), Mode.valueOf(rs.getString(5)),
                 rs.getString(6), rs.getString(7), rs.getLong(8), rs.getObject(9, OffsetDateTime.class),
                 rs.getObject(10, UUID.class) == null ? null : new CurrentQuestion(rs.getObject(10, UUID.class),
-                        rs.getString(11), rs.getString(12)), decodeAnswers(rs.getString(14)), rs.getString(13),
-                rs.getString(15), decodeEvaluation(rs.getString(16))), sessionId, owner).stream().findFirst();
+                        rs.getString(11), rs.getString(12)), decodeList(rs.getString(14), SavedAnswer.class), rs.getString(13),
+                rs.getString(15), decodeEvaluation(rs.getString(16)), rs.getObject(17, UUID.class),
+                rs.getInt(18), decodeList(rs.getString(19), CompletedBundle.class)), includeHistory, sessionId, owner)
+                .stream().findFirst();
     }
 
     public void deleteProject(UUID owner, UUID project, UUID job) {
@@ -217,11 +256,11 @@ public class InterviewSessions {
         }
     }
 
-    private List<SavedAnswer> decodeAnswers(String value) {
+    private <T> List<T> decodeList(String value, Class<T> type) {
         try {
-            return json.readValue(value, json.getTypeFactory().constructCollectionType(List.class, SavedAnswer.class));
+            return json.readValue(value, json.getTypeFactory().constructCollectionType(List.class, type));
         } catch (JsonProcessingException invalid) {
-            throw new IllegalStateException("Invalid stored interview answers", invalid);
+            throw new IllegalStateException("Invalid stored interview history", invalid);
         }
     }
 
