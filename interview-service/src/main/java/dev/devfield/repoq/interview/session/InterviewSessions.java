@@ -22,6 +22,8 @@ public class InterviewSessions {
 
     public record CurrentQuestion(UUID id, String text, String topicKey) {}
 
+    public record HistoryItem(UUID interviewId, Mode mode, String status, int completedBundles, OffsetDateTime createdAt) {}
+
     public record SavedAnswer(UUID questionId, String question, String answer) {}
 
     public record Evaluation(UUID evidenceId, String strengths, String gaps, String improvements,
@@ -97,6 +99,30 @@ public class InterviewSessions {
                 INSERT INTO interview.first_question_job(session_id,bundle_id,resolved_topic_key,evidence_id)
                 VALUES (?,?,?,?)
                 """, session, bundle, topic.key(), UUID.fromString(topic.primaryEvidenceId()));
+    }
+
+    List<HistoryItem> history(UUID owner, UUID project, OffsetDateTime before, UUID beforeId, int limit) {
+        String boundary = before == null ? "" : "AND (s.created_at,s.id)<(?,?)";
+        Object[] args = before == null ? new Object[]{owner, project, limit}
+                : new Object[]{owner, project, before, beforeId, limit};
+        return db.query("""
+                SELECT page.id,page.mode,page.status,page.created_at,
+                    (SELECT count(*) FROM interview.bundle_evaluation e
+                     WHERE e.session_id=page.id AND e.state='READY') AS completed_bundles
+                FROM (
+                    SELECT s.id,s.mode,s.created_at,CASE WHEN s.lifecycle='OPEN' THEN s.state ELSE s.lifecycle END AS status
+                    FROM interview.interview_session s
+                    JOIN interview.interview_write_fence u ON u.scope='USER' AND u.owner_user_id=s.owner_user_id
+                        AND u.state='ACTIVE'
+                    JOIN interview.interview_write_fence p ON p.scope='PROJECT' AND p.project_id=s.project_id
+                        AND p.owner_user_id=s.owner_user_id AND p.state='ACTIVE'
+                    WHERE s.owner_user_id=? AND s.project_id=? AND s.mode='FREE' %s
+                    ORDER BY s.created_at DESC,s.id DESC LIMIT ?
+                ) page
+                ORDER BY page.created_at DESC,page.id DESC
+                """.formatted(boundary), (rs, row) -> new HistoryItem(rs.getObject("id", UUID.class),
+                Mode.valueOf(rs.getString("mode")), rs.getString("status"), rs.getInt("completed_bundles"),
+                rs.getObject("created_at", OffsetDateTime.class)), args);
     }
 
     public Optional<Session> find(UUID owner, UUID sessionId) {
