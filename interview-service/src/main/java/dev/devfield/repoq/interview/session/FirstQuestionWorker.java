@@ -125,6 +125,13 @@ class FirstQuestionWorker {
                 """, jobState, question == null ? null : UUID.randomUUID(), question,
                 retry ? 2 << (claim.attempt() - 1) : 0, session, claim.attempt());
         if (updated == 1 && !retry) {
+            if (question != null) {
+                db.update("""
+                        INSERT INTO interview.question_turn(session_id,position,id,topic_key,evidence_id,question_text)
+                        SELECT session_id,0,question_id,resolved_topic_key,evidence_id,question_text
+                        FROM interview.first_question_job WHERE session_id=?
+                        """, session);
+            }
             db.update("UPDATE interview.interview_session SET state=?,version=version+1 WHERE id=?",
                     question == null ? "GENERATION_FAILED" : "ACTIVE", session);
         }
