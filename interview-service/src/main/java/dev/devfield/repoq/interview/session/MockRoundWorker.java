@@ -124,11 +124,12 @@ class MockRoundWorker {
             db.update("UPDATE interview.mock_job SET state='FAILED',lease_until=NULL WHERE session_id=? AND kind='SUMMARY'", id);
             return null;
         }
+        int leaseSeconds = ollama.longLeaseSeconds();
         var leaseUntil = db.queryForObject("""
                 UPDATE interview.mock_job SET state='RUNNING',attempt=attempt+1,
-                    lease_until=clock_timestamp()+interval '30 seconds',due_at=clock_timestamp()+interval '30 seconds'
+                    lease_until=clock_timestamp()+make_interval(secs=>?),due_at=clock_timestamp()+make_interval(secs=>?)
                 WHERE session_id=? AND kind='SUMMARY' RETURNING lease_until
-                """, OffsetDateTime.class, id);
+                """, OffsetDateTime.class, leaseSeconds, leaseSeconds, id);
         return new SummaryClaim(target, attempt + 1, leaseUntil, feedback);
     }
 
@@ -188,11 +189,12 @@ class MockRoundWorker {
             db.update("UPDATE interview.interview_session SET state='GENERATION_FAILED',version=version+1 WHERE id=?", id);
             return null;
         }
+        int leaseSeconds = ollama.longLeaseSeconds();
         db.update("""
                 UPDATE interview.mock_job SET state='RUNNING',attempt=attempt+1,
-                    lease_until=clock_timestamp()+interval '30 seconds',due_at=clock_timestamp()+interval '30 seconds'
+                    lease_until=clock_timestamp()+make_interval(secs=>?),due_at=clock_timestamp()+make_interval(secs=>?)
                 WHERE session_id=? AND kind='PLAN'
-                """, id);
+                """, leaseSeconds, leaseSeconds, id);
         return new Claim(target, attempt + 1, facts);
     }
 

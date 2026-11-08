@@ -23,6 +23,7 @@ devfield:
       jwks-uri: ${INTERVIEW_AUTH_JWKS_URI:}
       session-check-uri: ${INTERVIEW_AUTH_SESSION_CHECK_URI:}
       service-key: ${INTERVIEW_AUTH_SERVICE_KEY:}
+    ollama-long-timeout: ${INTERVIEW_OLLAMA_LONG_TIMEOUT:${devfield.interview.first-question.ollama-timeout}}
     sessions:
       enabled: ${INTERVIEW_SESSIONS_ENABLED:false}
     first-question:
