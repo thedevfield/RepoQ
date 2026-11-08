@@ -42,6 +42,8 @@ devfield:
       enabled: ${INTERVIEW_SESSION_DELETION_ENABLED:false}
     history:
       enabled: ${INTERVIEW_HISTORY_ENABLED:false}
+    mock:
+      enabled: ${INTERVIEW_MOCK_ENABLED:false}
     deletion:
       # Incoming X-02 and X-04 use distinct keys over protected service transport.
       project-key-sha256: ${INTERVIEW_X02_PROJECT_KEY_SHA256:}

@@ -5,8 +5,10 @@ import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.json.JsonMapper;
+import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.UUID;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -26,7 +28,7 @@ class BundleEvaluationWorker {
 
     private record Pending(int attempt, String topic, UUID evidence) {}
     private record Job(InterviewAnswers.Target target, UUID bundle) {}
-    private record Claim(Job job, int attempt, FirstQuestionGenerator.Input fact,
+    private record Claim(Job job, int attempt, OffsetDateTime leaseUntil, FirstQuestionGenerator.Input fact,
                          List<InterviewSessions.SavedAnswer> turns) {}
 
     private final JdbcTemplate db;
@@ -34,14 +36,17 @@ class BundleEvaluationWorker {
     private final InterviewSessions sessions;
     private final InterviewAnswers answers;
     private final OllamaFirstQuestionGenerator ollama;
+    private final boolean mockEnabled;
 
     BundleEvaluationWorker(JdbcTemplate db, TransactionTemplate tx, InterviewSessions sessions,
-                           InterviewAnswers answers, OllamaFirstQuestionGenerator ollama) {
+                           InterviewAnswers answers, OllamaFirstQuestionGenerator ollama,
+                   @Value("${devfield.interview.mock.enabled:false}") boolean mockEnabled) {
         this.db = db;
         this.tx = tx;
         this.sessions = sessions;
         this.answers = answers;
         this.ollama = ollama;
+        this.mockEnabled = mockEnabled;
     }
 
     @Scheduled(fixedDelayString = "${devfield.interview.evaluation.poll-ms:1000}",
@@ -50,15 +55,17 @@ class BundleEvaluationWorker {
         var due = db.query("""
                 SELECT s.id,s.owner_user_id,s.project_id,e.bundle_id
                 FROM interview.bundle_evaluation e JOIN interview.interview_session s ON s.id=e.session_id
+                LEFT JOIN interview.mock_round m ON m.session_id=s.id
                 JOIN interview.interview_write_fence u ON u.scope='USER' AND u.owner_user_id=s.owner_user_id AND u.state='ACTIVE'
                 JOIN interview.interview_write_fence p ON p.scope='PROJECT' AND p.project_id=s.project_id
                     AND p.owner_user_id=s.owner_user_id AND p.state='ACTIVE'
-                WHERE s.mode='FREE' AND s.lifecycle='OPEN' AND s.state='ACTIVE' AND e.state IN ('QUEUED','RUNNING')
-                    AND e.due_at<=clock_timestamp()
-                    AND e.bundle_id=(SELECT id FROM interview.question_bundle WHERE session_id=s.id ORDER BY sequence DESC LIMIT 1)
+                WHERE s.lifecycle='OPEN' AND e.state IN ('QUEUED','RUNNING') AND e.due_at<=clock_timestamp()
+                    AND ((s.mode='FREE' AND s.state='ACTIVE' AND e.bundle_id=(
+                        SELECT id FROM interview.question_bundle WHERE session_id=s.id ORDER BY sequence DESC LIMIT 1))
+                        OR (? AND m.session_id IS NOT NULL AND s.state='EVALUATING'))
                 ORDER BY e.due_at,e.session_id LIMIT 1
                 """, (rs, row) -> new Job(new InterviewAnswers.Target(rs.getObject(1, UUID.class),
-                rs.getObject(2, UUID.class), rs.getObject(3, UUID.class)), rs.getObject(4, UUID.class)));
+                rs.getObject(2, UUID.class), rs.getObject(3, UUID.class)), rs.getObject(4, UUID.class)), mockEnabled);
         if (due.isEmpty()) return;
         Claim claim = tx.execute(status -> claim(due.getFirst()));
         if (claim == null) return;
@@ -93,37 +100,54 @@ class BundleEvaluationWorker {
         var evidence = snapshot.evidenceReferences().stream()
                 .filter(item -> pending.evidence().toString().equals(item.id()) && "CODE_FACT".equals(item.claimType()))
                 .findFirst();
-        if (pending.attempt() > MAX_ATTEMPTS || !"QUESTIONS_COMPLETE".equals(session.answerProgress())
-                || session.answers().isEmpty() || evidence.isEmpty() || snapshot.topics().stream().noneMatch(item ->
+        var turns = session.managedMock() ? db.query("""
+                SELECT q.id,q.question_text,a.answer_text FROM interview.question_turn q
+                JOIN interview.user_answer a ON a.session_id=q.session_id AND a.question_id=q.id
+                WHERE q.bundle_id=? ORDER BY q.position
+                """, (rs, row) -> new InterviewSessions.SavedAnswer(rs.getObject(1, UUID.class),
+                rs.getString(2), rs.getString(3)), job.bundle()) : session.answers();
+        if (pending.attempt() > MAX_ATTEMPTS || !session.managedMock() && !"QUESTIONS_COMPLETE".equals(session.answerProgress())
+                || turns.isEmpty() || evidence.isEmpty() || snapshot.topics().stream().noneMatch(item ->
                         item.key().equals(pending.topic()) && pending.evidence().toString().equals(item.primaryEvidenceId()))) {
             db.update("UPDATE interview.bundle_evaluation SET state='FAILED',lease_until=NULL WHERE bundle_id=?", job.bundle());
             return null;
         }
 
-        db.update("""
+        var leaseUntil = db.queryForObject("""
                 UPDATE interview.bundle_evaluation SET state='RUNNING',attempt=?,
                     lease_until=clock_timestamp()+interval '30 seconds',due_at=clock_timestamp()+interval '30 seconds'
-                WHERE bundle_id=?
-                """, pending.attempt(), job.bundle());
-        return new Claim(job, pending.attempt(),
+                WHERE bundle_id=? RETURNING lease_until
+                """, OffsetDateTime.class, pending.attempt(), job.bundle());
+        return new Claim(job, pending.attempt(), leaseUntil,
                 new FirstQuestionGenerator.Input(pending.topic(), pending.evidence(), evidence.orElseThrow().summary()),
-                session.answers());
+                turns);
     }
 
     private void settle(Claim claim, JsonNode result, boolean retry) {
         if (!lockActive(claim.job())) return;
         String state = result != null ? "READY" : retry ? "QUEUED" : "FAILED";
-        db.update("""
+        int updated = db.update("""
                 UPDATE interview.bundle_evaluation SET state=?,result=CAST(? AS jsonb),lease_until=NULL,
                     due_at=clock_timestamp()+make_interval(secs=>?)
-                WHERE bundle_id=? AND state='RUNNING' AND attempt=? AND lease_until>clock_timestamp()
+                WHERE bundle_id=? AND state='RUNNING' AND attempt=? AND lease_until=? AND lease_until>clock_timestamp()
                 """, state, result == null ? null : result.toString(), retry ? 2 << (claim.attempt() - 1) : 0,
-                claim.job().bundle(), claim.attempt());
+                claim.job().bundle(), claim.attempt(), claim.leaseUntil());
+        if (updated == 1 && result != null) {
+            UUID session = claim.job().target().session();
+            db.update("""
+                    INSERT INTO interview.mock_job(session_id,kind)
+                    SELECT m.session_id,'SUMMARY' FROM interview.mock_round m WHERE m.session_id=?
+                      AND 5=(SELECT count(*) FROM interview.bundle_evaluation e
+                             WHERE e.session_id=m.session_id AND e.state='READY')
+                    ON CONFLICT (session_id,kind) DO NOTHING
+                    """, session);
+        }
     }
 
     private boolean lockActive(Job job) {
         try {
-            return "ACTIVE".equals(answers.lockSession(job.target()))
+            String state = answers.lockSession(job.target());
+            return "EVALUATING".equals(state) || "ACTIVE".equals(state)
                     && job.bundle().equals(answers.currentBundle(job.target().session()));
         } catch (InterviewSessions.WriteBlocked | InterviewSessions.DeletionConflict blocked) {
             return false;

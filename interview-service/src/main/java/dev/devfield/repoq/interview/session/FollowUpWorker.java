@@ -4,8 +4,10 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.json.JsonMapper;
+import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.UUID;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -23,7 +25,7 @@ class FollowUpWorker {
     record Turn(String question, String answer) {}
     private record Job(InterviewAnswers.Target target, UUID question, UUID bundle) {}
     private record Pending(int attempt, int position, String topic, UUID evidence) {}
-    private record Claim(Job job, Pending pending, FirstQuestionGenerator.Input fact, List<Turn> turns) {}
+    private record Claim(Job job, Pending pending, OffsetDateTime leaseUntil, FirstQuestionGenerator.Input fact, List<Turn> turns) {}
     private record Outcome(String state, String question) {}
 
     private final JdbcTemplate db;
@@ -31,14 +33,17 @@ class FollowUpWorker {
     private final InterviewSessions sessions;
     private final InterviewAnswers answers;
     private final OllamaFirstQuestionGenerator ollama;
+    private final boolean mockEnabled;
 
     FollowUpWorker(JdbcTemplate db, TransactionTemplate tx, InterviewSessions sessions, InterviewAnswers answers,
-                   OllamaFirstQuestionGenerator ollama) {
+                   OllamaFirstQuestionGenerator ollama,
+                   @Value("${devfield.interview.mock.enabled:false}") boolean mockEnabled) {
         this.db = db;
         this.tx = tx;
         this.sessions = sessions;
         this.answers = answers;
         this.ollama = ollama;
+        this.mockEnabled = mockEnabled;
     }
 
     @Scheduled(fixedDelayString = "${devfield.interview.follow-up.poll-ms:1000}",
@@ -48,15 +53,17 @@ class FollowUpWorker {
                 SELECT a.session_id,s.owner_user_id,s.project_id,a.question_id,q.bundle_id
                 FROM interview.user_answer a JOIN interview.interview_session s ON s.id=a.session_id
                 JOIN interview.question_turn q ON q.session_id=a.session_id AND q.id=a.question_id
+                LEFT JOIN interview.mock_round m ON m.session_id=s.id
                 JOIN interview.interview_write_fence u ON u.scope='USER' AND u.owner_user_id=s.owner_user_id AND u.state='ACTIVE'
                 JOIN interview.interview_write_fence p ON p.scope='PROJECT' AND p.project_id=s.project_id
                     AND p.owner_user_id=s.owner_user_id AND p.state='ACTIVE'
-                WHERE s.mode='FREE' AND s.lifecycle='OPEN' AND s.state='ACTIVE' AND a.state IN ('QUEUED','RUNNING')
+                WHERE (s.mode='FREE' OR (? AND m.session_id IS NOT NULL)) AND s.lifecycle='OPEN' AND s.state='ACTIVE' AND a.state IN ('QUEUED','RUNNING')
                     AND a.due_at<=clock_timestamp()
-                    AND q.bundle_id=(SELECT id FROM interview.question_bundle WHERE session_id=s.id ORDER BY sequence DESC LIMIT 1)
+                    AND q.bundle_id=(SELECT id FROM interview.question_bundle WHERE session_id=s.id
+                        AND (m.session_id IS NULL OR sequence=m.current_sequence) ORDER BY sequence DESC LIMIT 1)
                 ORDER BY a.due_at,a.session_id LIMIT 1
                 """, (rs, row) -> new Job(new InterviewAnswers.Target(rs.getObject(1, UUID.class),
-                rs.getObject(2, UUID.class), rs.getObject(3, UUID.class)), rs.getObject(4, UUID.class), rs.getObject(5, UUID.class)));
+                rs.getObject(2, UUID.class), rs.getObject(3, UUID.class)), rs.getObject(4, UUID.class), rs.getObject(5, UUID.class)), mockEnabled);
         if (due.isEmpty()) return;
 
         Claim claim = tx.execute(status -> claim(due.getFirst()));
@@ -104,12 +111,12 @@ class FollowUpWorker {
                 JOIN interview.user_answer a ON a.session_id=q.session_id AND a.question_id=q.id
                 WHERE q.bundle_id=? AND q.position<=? ORDER BY q.position
                 """, (rs, row) -> new Turn(rs.getString(1), rs.getString(2)), job.bundle(), pending.position());
-        db.update("""
+        var leaseUntil = db.queryForObject("""
                 UPDATE interview.user_answer SET state='RUNNING',attempt=?,
                     lease_until=clock_timestamp()+interval '30 seconds',due_at=clock_timestamp()+interval '30 seconds'
-                WHERE session_id=? AND question_id=?
-                """, pending.attempt(), session, job.question());
-        return new Claim(job, pending, new FirstQuestionGenerator.Input(pending.topic(), pending.evidence(),
+                WHERE session_id=? AND question_id=? RETURNING lease_until
+                """, OffsetDateTime.class, pending.attempt(), session, job.question());
+        return new Claim(job, pending, leaseUntil, new FirstQuestionGenerator.Input(pending.topic(), pending.evidence(),
                 evidence.orElseThrow().summary()), turns);
     }
 
@@ -120,11 +127,11 @@ class FollowUpWorker {
                 UPDATE interview.user_answer SET state=?,lease_until=NULL,
                     due_at=clock_timestamp()+make_interval(secs=>?)
                 WHERE session_id=? AND question_id=? AND state='RUNNING' AND attempt=?
-                    AND lease_until>clock_timestamp()
+                    AND lease_until=? AND lease_until>clock_timestamp()
                 """, outcome.state(), "QUEUED".equals(outcome.state()) ? 2 << (claim.pending().attempt() - 1) : 0,
-                session, claim.job().question(), claim.pending().attempt());
+                session, claim.job().question(), claim.pending().attempt(), claim.leaseUntil());
         if (updated == 1 && "STOPPED".equals(outcome.state())) {
-            answers.enqueueEvaluationIfStopped(session, claim.job().question());
+            answers.closeIfStopped(session, claim.job().question());
         }
         if (updated == 1 && "PUBLISHED".equals(outcome.state())) {
             db.update("""
