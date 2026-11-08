@@ -55,12 +55,14 @@ public class InterviewSessionController {
     private final boolean nextBundleEnabled;
     private final InterviewLifecycle lifecycle;
     private final boolean lifecycleEnabled;
+    private final boolean sessionDeletionEnabled;
 
     public InterviewSessionController(InterviewAuthentication auth, ProjectSnapshotClient snapshots,
                                       InterviewSessions sessions, InterviewAnswers answers, InterviewBundles bundles, InterviewLifecycle lifecycle,
                                       @Value("${devfield.interview.follow-up.enabled:false}") boolean followUpEnabled,
                                       @Value("${devfield.interview.next-bundle.enabled:false}") boolean nextBundleEnabled,
-                                      @Value("${devfield.interview.lifecycle.enabled:false}") boolean lifecycleEnabled) {
+                                      @Value("${devfield.interview.lifecycle.enabled:false}") boolean lifecycleEnabled,
+                                      @Value("${devfield.interview.session-deletion.enabled:false}") boolean sessionDeletionEnabled) {
         this.auth = auth;
         this.snapshots = snapshots;
         this.sessions = sessions;
@@ -70,6 +72,7 @@ public class InterviewSessionController {
         this.nextBundleEnabled = nextBundleEnabled;
         this.lifecycle = lifecycle;
         this.lifecycleEnabled = lifecycleEnabled;
+        this.sessionDeletionEnabled = sessionDeletionEnabled;
     }
 
     @PostMapping("/api/interviews")
@@ -152,6 +155,14 @@ public class InterviewSessionController {
             case CONFLICT -> error(409, "interview_state_conflict");
             case NOT_FOUND -> error(404, "interview_not_found");
         };
+    }
+
+    @DeleteMapping("/api/interviews/{id}")
+    public ResponseEntity<?> delete(@AuthenticationPrincipal Jwt jwt, @PathVariable UUID id) {
+        if (!sessionDeletionEnabled) return error(403, "interview_unavailable");
+        auth.verify("Bearer " + jwt.getTokenValue());
+        if (!lifecycle.delete(UUID.fromString(jwt.getSubject()), id)) return error(404, "interview_not_found");
+        return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
     }
 
     @ExceptionHandler(InterviewAuthentication.Rejected.class)
