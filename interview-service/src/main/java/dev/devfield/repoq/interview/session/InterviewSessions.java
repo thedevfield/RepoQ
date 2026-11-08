@@ -19,7 +19,7 @@ public class InterviewSessions {
     public enum Mode { FREE, MOCK }
 
     public record Session(UUID id, UUID ownerUserId, UUID projectId, ProjectSnapshot snapshot,
-                          Mode mode, long version, OffsetDateTime createdAt) {}
+                          Mode mode, String state, String topicKey, long version, OffsetDateTime createdAt) {}
 
     public static final class WriteBlocked extends RuntimeException {}
     public static final class DeletionConflict extends RuntimeException {}
@@ -43,6 +43,10 @@ public class InterviewSessions {
 
     // Only call after the owner's active session and project access have been validated.
     public Session create(UUID owner, UUID project, Mode mode, ProjectSnapshot snapshot) {
+        return create(owner, project, mode, snapshot, null);
+    }
+
+    public Session create(UUID owner, UUID project, Mode mode, ProjectSnapshot snapshot, String topicKey) {
         UUID id = UUID.randomUUID();
         UUID snapshotId = UUID.fromString(snapshot.snapshotId());
         String context = encode(snapshot);
@@ -51,26 +55,27 @@ public class InterviewSessions {
             if (!lockProject(owner, project).active()) throw new WriteBlocked();
             OffsetDateTime created = db.queryForObject("""
                     INSERT INTO interview.interview_session
-                        (id, owner_user_id, project_id, mode, snapshot_id, membership_version, snapshot_context)
-                    VALUES (?, ?, ?, ?, ?, ?, CAST(? AS jsonb))
+                        (id, owner_user_id, project_id, mode, snapshot_id, membership_version, snapshot_context, requested_topic_key)
+                    VALUES (?, ?, ?, ?, ?, ?, CAST(? AS jsonb), ?)
                     RETURNING created_at
                     """, OffsetDateTime.class, id, owner, project, mode.name(), snapshotId,
-                    snapshot.membershipVersion(), context);
-            return new Session(id, owner, project, snapshot, mode, 1, created);
+                    snapshot.membershipVersion(), context, topicKey);
+            return new Session(id, owner, project, snapshot, mode, "PREPARING", topicKey, 1, created);
         });
     }
 
     public Optional<Session> find(UUID owner, UUID sessionId) {
         return db.query("""
-                SELECT s.id, s.owner_user_id, s.project_id, s.snapshot_context::text, s.mode, s.version, s.created_at
+                SELECT s.id, s.owner_user_id, s.project_id, s.snapshot_context::text, s.mode,
+                       s.state, s.requested_topic_key, s.version, s.created_at
                 FROM interview.interview_session s
                 JOIN interview.interview_write_fence u ON u.scope='USER' AND u.owner_user_id=s.owner_user_id
                 JOIN interview.interview_write_fence p ON p.scope='PROJECT' AND p.project_id=s.project_id
                     AND p.owner_user_id=s.owner_user_id
                 WHERE s.id=? AND s.owner_user_id=? AND u.state='ACTIVE' AND p.state='ACTIVE'
                 """, (rs, row) -> new Session(rs.getObject(1, UUID.class), rs.getObject(2, UUID.class),
-                rs.getObject(3, UUID.class), decode(rs.getString(4)), Mode.valueOf(rs.getString(5)), rs.getLong(6),
-                rs.getObject(7, OffsetDateTime.class)), sessionId, owner).stream().findFirst();
+                rs.getObject(3, UUID.class), decode(rs.getString(4)), Mode.valueOf(rs.getString(5)),
+                rs.getString(6), rs.getString(7), rs.getLong(8), rs.getObject(9, OffsetDateTime.class)), sessionId, owner).stream().findFirst();
     }
 
     public void deleteProject(UUID owner, UUID project, UUID job) {

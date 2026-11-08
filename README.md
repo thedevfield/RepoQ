@@ -32,6 +32,10 @@ Configure Interview with `INTERVIEW_AUTH_ISSUER`, `INTERVIEW_AUTH_AUDIENCE`, `IN
 
 Production requires HTTPS or an equivalently protected transport path (such as a TLS-encrypted service mesh) for Interview → Project and Interview → Auth. Use plain HTTP only for local loopback development and tests.
 
+## Interview session API (I-01 / I-03)
+
+The FREE session API is disabled by default. Enable it with `INTERVIEW_SESSIONS_ENABLED=true` for integration testing. I-01 returns 201 with a new session ID and pins the Public X-01 Snapshot and requested active topic or `RANDOM`. Each successful POST creates a separate session. I-03 returns owner-only session metadata. `PREPARING` records the initial state. Question generation and MOCK are outside this API increment.
+
 ## Interview deletion (X-02 / X-04)
 
 Persist the first `deletionJobId` for the target and reuse it on every retry, including after a timeout or lost response. Once a deletion fence binds a target to a job ID, a different job ID for that target returns `409 deletion_conflict`, even after completion. A retry with the original ID returns `204 No Content` once cleanup is committed.
