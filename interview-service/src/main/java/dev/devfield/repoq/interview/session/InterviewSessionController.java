@@ -4,6 +4,11 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 import dev.devfield.repoq.interview.project.ProjectSnapshotClient;
 import dev.devfield.repoq.interview.security.InterviewAuthentication;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.time.DateTimeException;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -22,6 +27,31 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 @RestController
 @ConditionalOnProperty(name = "devfield.interview.sessions.enabled", havingValue = "true")
 public class InterviewSessionController {
+    public record HistoryPage(List<InterviewSessions.HistoryItem> items,
+                              @JsonInclude(JsonInclude.Include.ALWAYS) String nextCursor) {}
+
+    private record HistoryCursor(OffsetDateTime createdAt, UUID id) {
+        static HistoryCursor decode(UUID project, String token) {
+            if (token.length() > 256) throw new IllegalArgumentException();
+            String[] fields = new String(Base64.getUrlDecoder().decode(token), StandardCharsets.UTF_8).split("\\|", -1);
+            if (fields.length != 4 || !"v1".equals(fields[0]) || !project.toString().equals(fields[1])) {
+                throw new IllegalArgumentException();
+            }
+            var timestamp = OffsetDateTime.parse(fields[2]).withOffsetSameInstant(ZoneOffset.UTC);
+            if (timestamp.getYear() < 1 || timestamp.getYear() > 9999 || timestamp.getNano() % 1000 != 0) {
+                throw new IllegalArgumentException();
+            }
+            UUID id = UUID.fromString(fields[3]);
+            if (!id.toString().equals(fields[3])) throw new IllegalArgumentException();
+            return new HistoryCursor(timestamp, id);
+        }
+
+        static String encode(UUID project, InterviewSessions.HistoryItem item) {
+            String value = "v1|" + project + "|" + item.createdAt() + "|" + item.interviewId();
+            return Base64.getUrlEncoder().withoutPadding().encodeToString(value.getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
     public record Start(UUID projectId, InterviewSessions.Mode mode, String topicKey) {}
     public record Answer(UUID questionId, String answer, String submissionId) {}
     public record LifecycleChange(String action) {}
@@ -56,13 +86,15 @@ public class InterviewSessionController {
     private final InterviewLifecycle lifecycle;
     private final boolean lifecycleEnabled;
     private final boolean sessionDeletionEnabled;
+    private final boolean historyEnabled;
 
     public InterviewSessionController(InterviewAuthentication auth, ProjectSnapshotClient snapshots,
                                       InterviewSessions sessions, InterviewAnswers answers, InterviewBundles bundles, InterviewLifecycle lifecycle,
                                       @Value("${devfield.interview.follow-up.enabled:false}") boolean followUpEnabled,
                                       @Value("${devfield.interview.next-bundle.enabled:false}") boolean nextBundleEnabled,
                                       @Value("${devfield.interview.lifecycle.enabled:false}") boolean lifecycleEnabled,
-                                      @Value("${devfield.interview.session-deletion.enabled:false}") boolean sessionDeletionEnabled) {
+                                      @Value("${devfield.interview.session-deletion.enabled:false}") boolean sessionDeletionEnabled,
+                                      @Value("${devfield.interview.history.enabled:false}") boolean historyEnabled) {
         this.auth = auth;
         this.snapshots = snapshots;
         this.sessions = sessions;
@@ -73,6 +105,7 @@ public class InterviewSessionController {
         this.lifecycle = lifecycle;
         this.lifecycleEnabled = lifecycleEnabled;
         this.sessionDeletionEnabled = sessionDeletionEnabled;
+        this.historyEnabled = historyEnabled;
     }
 
     @PostMapping("/api/interviews")
@@ -90,6 +123,27 @@ public class InterviewSessionController {
         var session = sessions.create(UUID.fromString(jwt.getSubject()), request.projectId(), request.mode(), snapshot, topic);
         return ResponseEntity.created(URI.create("/api/interviews/" + session.id())).cacheControl(CacheControl.noStore())
                 .body(Detail.from(session, followUpEnabled, nextBundleEnabled));
+    }
+
+    @GetMapping("/api/interviews")
+    public ResponseEntity<?> history(@AuthenticationPrincipal Jwt jwt, @RequestParam(required = false) UUID projectId,
+                                     @RequestParam(defaultValue = "20") int limit,
+                                     @RequestParam(required = false) String cursor) {
+        if (!historyEnabled) return error(403, "interview_unavailable");
+        auth.verify("Bearer " + jwt.getTokenValue());
+        if (projectId == null) return error(400, "invalid_request");
+        if (limit < 1 || limit > 50) return error(400, "invalid_limit");
+        HistoryCursor boundary;
+        try {
+            boundary = cursor == null ? null : HistoryCursor.decode(projectId, cursor);
+        } catch (IllegalArgumentException | DateTimeException invalid) {
+            return error(400, "invalid_cursor");
+        }
+        var rows = sessions.history(UUID.fromString(jwt.getSubject()), projectId,
+                boundary == null ? null : boundary.createdAt(), boundary == null ? null : boundary.id(), limit + 1);
+        var items = rows.subList(0, Math.min(limit, rows.size()));
+        String next = rows.size() > limit ? HistoryCursor.encode(projectId, items.getLast()) : null;
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new HistoryPage(items, next));
     }
 
     @GetMapping("/api/interviews/{id}")

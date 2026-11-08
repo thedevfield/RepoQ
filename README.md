@@ -50,6 +50,8 @@ Set `INTERVIEW_LIFECYCLE_ENABLED=true` with the session flag to enable FREE I-06
 
 Set `INTERVIEW_SESSION_DELETION_ENABLED=true` with the session flag to enable FREE I-07. `DELETE /api/interviews/{id}` deletes the owner's session and its saved Snapshot, bundles, questions, answers, evaluations and generation jobs. A committed deletion returns `204`. Unknown, already deleted or inaccessible sessions return `404`. If a project or account deletion barrier has already committed and the target row still exists, I-07 returns `409`.
 
+Set `INTERVIEW_HISTORY_ENABLED=true` with the session flag to enable FREE I-02. `GET /api/interviews?projectId=<uuid>` lists the owner's FREE sessions newest first. The optional `limit` defaults to 20 and accepts 1–50. Pass the response's `nextCursor` as `cursor` to fetch the next page for the same project. An empty result returns `200` with `items: []` and `nextCursor: null`. Individual deletes and committed project or account deletion barriers hide the affected history.
+
 ## Interview deletion (X-02 / X-04)
 
 Persist the first `deletionJobId` for the target and reuse it on every retry, including after a timeout or lost response. Once a deletion fence binds a target to a job ID, a different job ID for that target returns `409 deletion_conflict`, even after completion. A retry with the original ID returns `204 No Content` once cleanup is committed.

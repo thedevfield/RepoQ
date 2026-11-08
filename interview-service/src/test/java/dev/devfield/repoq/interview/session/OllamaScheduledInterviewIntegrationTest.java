@@ -187,6 +187,15 @@ class OllamaScheduledInterviewIntegrationTest {
     }
 
     @Test
+    void historyIsDisabledByDefault() throws Exception {
+        try (var http = HttpClient.newHttpClient()) {
+            start(http);
+            assertEquals(403, http.send(request("/api/interviews?projectId=" + PROJECT).GET().build(),
+                    HttpResponse.BodyHandlers.discarding()).statusCode());
+        }
+    }
+
+    @Test
     void sessionDeletionIsDisabledByDefault() throws Exception {
         try (var http = HttpClient.newHttpClient()) {
             UUID id = start(http);
