@@ -34,7 +34,9 @@ Production requires HTTPS or an equivalently protected transport path (such as a
 
 ## Interview session API (I-01 / I-03)
 
-The FREE session API is disabled by default. Enable it with `INTERVIEW_SESSIONS_ENABLED=true` for integration testing. I-01 returns 201 with a new session ID and pins the Public X-01 Snapshot and requested active topic or `RANDOM`. Each successful POST creates a separate session. I-03 returns owner-only session metadata. `PREPARING` records the initial state. Question generation and MOCK are outside this API increment.
+The FREE session API is disabled by default. Enable it with `INTERVIEW_SESSIONS_ENABLED=true` for integration testing. I-01 returns 201 with a new session ID and pins the Public X-01 Snapshot and requested active topic or `RANDOM`. Each successful POST creates a separate session. I-03 returns owner-only session metadata. `PREPARING` records the initial state. MOCK is outside this API increment.
+
+The first-question worker is also disabled by default. For local tests, enable both `INTERVIEW_SESSIONS_ENABLED` and `INTERVIEW_FIRST_QUESTION_FAKE_ENABLED`. A new FREE session queues one first MAIN question using its pinned topic and code fact. I-03 returns `currentQuestion` when ready or `GENERATION_FAILED` when generation stops. Existing sessions are not queued by the migration. The fake generator makes no model or network calls.
 
 ## Interview deletion (X-02 / X-04)
 
