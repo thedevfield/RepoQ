@@ -1,11 +1,13 @@
 package dev.devfield.repoq.interview.session;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpServer;
+import dev.devfield.repoq.interview.InterviewApplication;
 import dev.devfield.repoq.interview.project.ProjectSnapshot;
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -30,9 +32,13 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.ApplicationContext;
+import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.context.support.GenericApplicationContext;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
@@ -67,6 +73,8 @@ class OllamaScheduledInterviewIntegrationTest {
 
     private static final AtomicReference<Reply> FOLLOW_UP_REPLY = new AtomicReference<>();
     private static final AtomicReference<JsonNode> FOLLOW_UP_REQUEST = new AtomicReference<>();
+    private static final AtomicReference<Reply> EVALUATION_REPLY = new AtomicReference<>();
+    private static final AtomicReference<JsonNode> EVALUATION_REQUEST = new AtomicReference<>();
     private static HttpServer upstream;
     private static ExecutorService upstreamThreads;
 
@@ -117,9 +125,17 @@ class OllamaScheduledInterviewIntegrationTest {
             try (exchange) {
                 JsonNode request = JSON.readTree(exchange.getRequestBody());
                 String content = OllamaFirstQuestionGeneratorTest.content(EVIDENCE);
-                if (request.at("/format/properties/action").isObject()) {
+                Reply reply = null;
+                if (request.at("/format/properties/exampleAnswer").isObject()) {
+                    EVALUATION_REQUEST.set(request);
+                    reply = EVALUATION_REPLY.get();
+                } else if (request.at("/format/properties/action").isObject()) {
                     FOLLOW_UP_REQUEST.set(request);
-                    Reply reply = FOLLOW_UP_REPLY.get();
+                    reply = FOLLOW_UP_REPLY.get();
+                } else {
+                    OLLAMA_REQUEST.set(request);
+                }
+                if (reply != null) {
                     if (reply.entered() != null) {
                         reply.entered().countDown();
                         try {
@@ -134,8 +150,6 @@ class OllamaScheduledInterviewIntegrationTest {
                         return;
                     }
                     content = reply.content();
-                } else {
-                    OLLAMA_REQUEST.set(request);
                 }
                 byte[] body = OllamaFirstQuestionGeneratorTest.envelope(content, true, "stop");
                 exchange.getResponseHeaders().set("Content-Type", "application/json");
@@ -158,6 +172,8 @@ class OllamaScheduledInterviewIntegrationTest {
         db.update("DELETE FROM interview.interview_write_fence WHERE owner_user_id=?", OWNER);
         FOLLOW_UP_REPLY.set(null);
         FOLLOW_UP_REQUEST.set(null);
+        EVALUATION_REPLY.set(null);
+        EVALUATION_REQUEST.set(null);
     }
 
     @Test
@@ -279,6 +295,8 @@ class OllamaScheduledInterviewIntegrationTest {
             followUp.poll();
             JsonNode result = detail(http, id);
             assertEquals(stop ? "QUESTIONS_COMPLETE" : "FOLLOW_UP_FAILED", result.path("answerProgress").asText());
+            assertFalse(result.has("evaluationStatus"));
+            assertEquals(0, evaluationCount(id));
             assertEquals("saved", result.at("/answers/0/answer").asText());
             assertFalse(result.has("currentQuestion"));
         }
@@ -387,11 +405,52 @@ class OllamaScheduledInterviewIntegrationTest {
     }
 
     @Nested
-    @TestPropertySource(properties = "devfield.interview.follow-up.poll-ms=100")
+    @TestPropertySource(properties = {
+            "devfield.interview.follow-up.poll-ms=100",
+            "devfield.interview.evaluation.enabled=true",
+            "devfield.interview.evaluation.poll-ms=100"
+    })
     @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
     class ScheduledFollowUp {
         @LocalServerPort int scheduledPort;
         @MockitoBean JwtDecoder scheduledDecoder;
+
+        @Test
+        void scheduledEvaluationPublishesOnlyAfterNormalStop() throws Exception {
+            port = scheduledPort;
+            var entered = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            EVALUATION_REPLY.set(new Reply(200, evaluation(EVIDENCE, "Clear trade-off."), entered, release));
+            FOLLOW_UP_REPLY.set(new Reply(200, outcome("STOP", "", EVIDENCE)));
+            try (var http = HttpClient.newHttpClient()) {
+                UUID id = start(http, scheduledDecoder);
+                String question = detail(http, id).at("/currentQuestion/id").asText();
+                assertFalse(detail(http, id).has("evaluationStatus"));
+                assertEquals(202, submit(http, id, question, "I chose simplicity.", "evaluated"));
+                try {
+                    assertTrue(entered.await(10, TimeUnit.SECONDS));
+                    var pending = detail(http, id);
+                    assertEquals("QUESTIONS_COMPLETE", pending.path("answerProgress").asText());
+                    assertEquals("PENDING", pending.path("evaluationStatus").asText());
+                    assertEquals(0, pending.path("completedBundles").asInt());
+                    assertFalse(pending.has("evaluation"));
+                    assertEquals(202, submit(http, id, question, "I chose simplicity.", "evaluated"));
+                } finally {
+                    release.countDown();
+                }
+                var published = awaitEvaluation(http, id, "READY");
+                assertEquals(1, published.path("completedBundles").asInt());
+                assertEquals("Clear trade-off.", published.at("/evaluation/strengths").asText());
+                var request = EVALUATION_REQUEST.get();
+                assertEquals(EVIDENCE.toString(), request.at("/format/properties/evidenceId/enum/0").asText());
+                var data = JSON.readTree(request.at("/messages/1/content").asText());
+                assertEquals(SUMMARY, data.path("codeFact").asText());
+                assertEquals(question, data.at("/turns/0/questionId").asText());
+                assertEquals("I chose simplicity.", data.at("/turns/0/answer").asText());
+            } finally {
+                release.countDown();
+            }
+        }
 
         @Test
         void publishesFollowUpAfterAnswerSubmission() throws Exception {
@@ -422,6 +481,244 @@ class OllamaScheduledInterviewIntegrationTest {
                 assertEquals("I chose simplicity.", input.at("/turns/0/answer").asText());
             }
         }
+    }
+
+    @Nested
+    @TestPropertySource(properties = {
+            "devfield.interview.evaluation.enabled=true",
+            "devfield.interview.evaluation.poll-ms=3600000"
+    })
+    @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
+    class EvaluationRaces {
+        @LocalServerPort int evaluationPort;
+        @MockitoBean JwtDecoder evaluationDecoder;
+        @Autowired BundleEvaluationWorker worker;
+        @Autowired FollowUpWorker closingWorker;
+
+        @Test
+        void thirdFollowUpClosesBundleAndQueuesOnce() throws Exception {
+            port = evaluationPort;
+            try (var http = HttpClient.newHttpClient()) {
+                UUID id = start(http, evaluationDecoder);
+                for (int i = 0; i < 4; i++) {
+                    String question = detail(http, id).at("/currentQuestion/id").asText();
+                    assertEquals(202, submit(http, id, question, "answer " + i, "turn-" + i));
+                    if (i < 3) {
+                        assertFalse(detail(http, id).has("evaluationStatus"));
+                        FOLLOW_UP_REPLY.set(new Reply(200, outcome("FOLLOW_UP", "Trade-off " + i + "?", EVIDENCE)));
+                        closingWorker.poll();
+                    } else {
+                        assertEquals(202, submit(http, id, question, "answer " + i, "turn-" + i));
+                    }
+                }
+                assertEquals(1, evaluationCount(id));
+                assertEquals("PENDING", detail(http, id).path("evaluationStatus").asText());
+                EVALUATION_REPLY.set(new Reply(200, evaluation(EVIDENCE, "Refined reasoning.")));
+                worker.poll();
+                assertEquals("READY", detail(http, id).path("evaluationStatus").asText());
+                var input = JSON.readTree(EVALUATION_REQUEST.get().at("/messages/1/content").asText());
+                assertEquals(4, input.path("turns").size());
+                assertEquals("answer 3", input.at("/turns/3/answer").asText());
+            }
+        }
+
+        @ParameterizedTest @ValueSource(booleans = {false, true})
+        void evaluationFailurePreservesAnswers(boolean transientFailure) throws Exception {
+            port = evaluationPort;
+            try (var http = HttpClient.newHttpClient()) {
+                UUID id = closeNormally(http);
+                EVALUATION_REPLY.set(transientFailure ? new Reply(503, null)
+                        : new Reply(200, evaluation(UUID.randomUUID(), "Unsupported evidence.")));
+                int attempts = transientFailure ? 3 : 1;
+                for (int attempt = 1; attempt <= attempts; attempt++) {
+                    worker.poll();
+                    assertEquals(attempt, db.queryForObject(
+                            "SELECT attempt FROM interview.bundle_evaluation WHERE session_id=?", Integer.class, id));
+                    var detail = detail(http, id);
+                    assertEquals(attempt < attempts ? "PENDING" : "FAILED", detail.path("evaluationStatus").asText());
+                    assertFalse(detail.has("evaluation"));
+                    assertEquals(0, detail.path("completedBundles").asInt());
+                    assertEquals("saved answer", detail.at("/answers/0/answer").asText());
+                    db.update("UPDATE interview.bundle_evaluation SET due_at=clock_timestamp() WHERE session_id=?", id);
+                }
+                worker.poll();
+                assertEquals("FAILED", detail(http, id).path("evaluationStatus").asText());
+            }
+        }
+
+        @ParameterizedTest @ValueSource(booleans = {false, true})
+        void deletionCascadesPublishedEvaluationAndFencesLateResult(boolean userDeletion) throws Exception {
+            port = evaluationPort;
+            try (var http = HttpClient.newHttpClient(); var executor = Executors.newSingleThreadExecutor()) {
+                UUID published = closeNormally(http);
+                EVALUATION_REPLY.set(new Reply(200, evaluation(EVIDENCE, "Published.")));
+                worker.poll();
+                assertEquals("READY", detail(http, published).path("evaluationStatus").asText());
+
+                UUID late = closeNormally(http);
+                var entered = new CountDownLatch(1);
+                var release = new CountDownLatch(1);
+                EVALUATION_REPLY.set(new Reply(200, evaluation(EVIDENCE, "Late result."), entered, release));
+                String blocker = "interview.test_evaluation_" + late.toString().replace("-", "");
+                UUID job = UUID.randomUUID();
+                db.execute("CREATE TABLE " + blocker + " (id uuid REFERENCES interview.interview_session(id))");
+                try {
+                    db.update("INSERT INTO " + blocker + " VALUES (?)", late);
+                    var running = executor.submit(worker::poll);
+                    try {
+                        assertTrue(entered.await(5, TimeUnit.SECONDS));
+                        assertEquals(503, delete(http, userDeletion, job));
+                        for (UUID id : List.of(published, late)) {
+                            assertEquals(404, http.send(request("/api/interviews/" + id).GET().build(),
+                                    HttpResponse.BodyHandlers.discarding()).statusCode());
+                        }
+                    } finally {
+                        release.countDown();
+                    }
+                    running.get(10, TimeUnit.SECONDS);
+                    assertEquals("RUNNING", db.queryForObject(
+                            "SELECT state FROM interview.bundle_evaluation WHERE session_id=?", String.class, late));
+                    assertNull(db.queryForObject(
+                            "SELECT result::text FROM interview.bundle_evaluation WHERE session_id=?", String.class, late));
+                } finally {
+                    db.execute("DROP TABLE " + blocker);
+                }
+                assertEquals(204, delete(http, userDeletion, job));
+                assertEquals(0, evaluationCount(published));
+                assertEquals(0, evaluationCount(late));
+            }
+        }
+
+        @Test
+        void expiredAttemptCannotPublishWhileReplacementRuns() throws Exception {
+            port = evaluationPort;
+            try (var http = HttpClient.newHttpClient(); var executor = Executors.newFixedThreadPool(2)) {
+                UUID id = closeNormally(http);
+                var firstEntered = new CountDownLatch(1);
+                var firstRelease = new CountDownLatch(1);
+                var secondEntered = new CountDownLatch(1);
+                var secondRelease = new CountDownLatch(1);
+                EVALUATION_REPLY.set(new Reply(200, evaluation(EVIDENCE, "Expired."), firstEntered, firstRelease));
+                var first = executor.submit(worker::poll);
+                try {
+                    assertTrue(firstEntered.await(5, TimeUnit.SECONDS));
+                    db.update("""
+                            UPDATE interview.bundle_evaluation SET due_at=clock_timestamp(),lease_until=clock_timestamp()
+                            WHERE session_id=?
+                            """, id);
+                    EVALUATION_REPLY.set(new Reply(200, evaluation(EVIDENCE, "Replacement."), secondEntered, secondRelease));
+                    var second = executor.submit(worker::poll);
+                    assertTrue(secondEntered.await(5, TimeUnit.SECONDS));
+                    firstRelease.countDown();
+                    first.get(10, TimeUnit.SECONDS);
+                    var pending = detail(http, id);
+                    assertEquals("PENDING", pending.path("evaluationStatus").asText());
+                    assertFalse(pending.has("evaluation"));
+                    secondRelease.countDown();
+                    second.get(10, TimeUnit.SECONDS);
+                    assertEquals("Replacement.", detail(http, id).at("/evaluation/strengths").asText());
+                } finally {
+                    firstRelease.countDown();
+                    secondRelease.countDown();
+                }
+            }
+        }
+
+        private UUID closeNormally(HttpClient http) throws Exception {
+            UUID id = start(http, evaluationDecoder);
+            String question = detail(http, id).at("/currentQuestion/id").asText();
+            assertEquals(202, submit(http, id, question, "saved answer", "evaluation"));
+            FOLLOW_UP_REPLY.set(new Reply(200, outcome("STOP", "", EVIDENCE)));
+            closingWorker.poll();
+            assertEquals("PENDING", detail(http, id).path("evaluationStatus").asText());
+            return id;
+        }
+    }
+
+    @Test
+    void scheduledEvaluationResumesAfterContextRestart() throws Exception {
+        JwtDecoder restartDecoder = mock(JwtDecoder.class);
+        FOLLOW_UP_REPLY.set(new Reply(200, outcome("STOP", "", EVIDENCE)));
+        EVALUATION_REPLY.set(new Reply(200, evaluation(EVIDENCE, "Recovered after restart.")));
+
+        try (var http = HttpClient.newHttpClient()) {
+            UUID id;
+            try (var before = startEvaluationContext(restartDecoder, 3_600_000)) {
+                port = ((WebServerApplicationContext) before).getWebServer().getPort();
+                id = start(http, restartDecoder);
+                String question = detail(http, id).at("/currentQuestion/id").asText();
+                assertEquals(202, submit(http, id, question, "Persisted answer.", "restart"));
+                var pending = awaitEvaluation(http, id, "PENDING");
+                assertFalse(pending.has("evaluation"));
+            }
+
+            assertEquals("QUEUED", db.queryForObject("""
+                    SELECT state FROM interview.bundle_evaluation WHERE session_id=?
+                    """, String.class, id));
+            assertNull(EVALUATION_REQUEST.get());
+
+            try (var after = startEvaluationContext(restartDecoder, 100)) {
+                port = ((WebServerApplicationContext) after).getWebServer().getPort();
+                var published = awaitEvaluation(http, id, "READY");
+                assertEquals(1, published.path("completedBundles").asInt());
+                assertEquals("Recovered after restart.", published.at("/evaluation/strengths").asText());
+                assertEquals("Persisted answer.", published.at("/answers/0/answer").asText());
+                var sent = EVALUATION_REQUEST.get();
+                assertNotNull(sent);
+                var input = JSON.readTree(sent.at("/messages/1/content").asText());
+                assertEquals(EVIDENCE.toString(), input.path("evidenceId").asText());
+                assertEquals("Persisted answer.", input.at("/turns/0/answer").asText());
+            }
+        }
+    }
+
+    private ConfigurableApplicationContext startEvaluationContext(JwtDecoder jwtDecoder, int pollMillis) {
+        var environment = context.getEnvironment();
+        return new SpringApplicationBuilder(InterviewApplication.class)
+                .registerShutdownHook(false)
+                .initializers(application -> ((GenericApplicationContext) application)
+                        .registerBean("restartTestJwtDecoder", JwtDecoder.class, () -> jwtDecoder,
+                                definition -> definition.setPrimary(true)))
+                .run("--server.port=0",
+                        "--devfield.interview.sessions.enabled=true",
+                        "--devfield.interview.first-question.fake-enabled=false",
+                        "--devfield.interview.first-question.ollama-enabled=true",
+                        "--devfield.interview.first-question.ollama-port=" + upstream.getAddress().getPort(),
+                        "--devfield.interview.first-question.poll-ms=100",
+                        "--devfield.interview.follow-up.enabled=true",
+                        "--devfield.interview.follow-up.poll-ms=100",
+                        "--devfield.interview.evaluation.enabled=true",
+                        "--devfield.interview.evaluation.poll-ms=" + pollMillis,
+                        "--devfield.interview.auth.session-check-uri="
+                                + environment.getRequiredProperty("devfield.interview.auth.session-check-uri"),
+                        "--devfield.interview.auth.service-key="
+                                + environment.getRequiredProperty("devfield.interview.auth.service-key"),
+                        "--devfield.interview.project.base-url="
+                                + environment.getRequiredProperty("devfield.interview.project.base-url"),
+                        "--devfield.interview.project.service-key="
+                                + environment.getRequiredProperty("devfield.interview.project.service-key"));
+    }
+
+    private int evaluationCount(UUID id) {
+        return db.queryForObject("SELECT count(*) FROM interview.bundle_evaluation WHERE session_id=?", Integer.class, id);
+    }
+
+    private JsonNode awaitEvaluation(HttpClient http, UUID id, String status) throws Exception {
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        JsonNode result;
+        do {
+            result = detail(http, id);
+            if (status.equals(result.path("evaluationStatus").asText())) return result;
+            Thread.sleep(50);
+        } while (System.nanoTime() < deadline);
+        throw new AssertionError("Evaluation did not reach " + status + ": " + result);
+    }
+
+    private static String evaluation(UUID evidence, String strengths) {
+        return JSON.valueToTree(Map.of("evidenceId", evidence, "strengths", strengths,
+                "gaps", "Discuss the alternative.", "improvements", "Compare maintenance costs.",
+                "exampleAnswer", "I chose a simpler implementation.", "keyPoints", "State the trade-off.",
+                "limitations", "The supplied code does not establish performance.")).toString();
     }
 
     private static String outcome(String action, String question, UUID evidence) {

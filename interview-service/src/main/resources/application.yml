@@ -32,6 +32,8 @@ devfield:
       ollama-timeout: ${INTERVIEW_FIRST_QUESTION_OLLAMA_TIMEOUT:PT20S}
     follow-up:
       enabled: ${INTERVIEW_FOLLOW_UP_ENABLED:false}
+    evaluation:
+      enabled: ${INTERVIEW_EVALUATION_ENABLED:false}
     deletion:
       # Incoming X-02 and X-04 use distinct keys over protected service transport.
       project-key-sha256: ${INTERVIEW_X02_PROJECT_KEY_SHA256:}
